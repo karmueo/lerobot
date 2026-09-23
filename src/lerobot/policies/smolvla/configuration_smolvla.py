@@ -68,6 +68,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
+    # When non-zero, train only the final N VLM text layers and the image connector
+    # in addition to the action expert. Requires train_expert_only=False.
+    train_vlm_layers: int = 0
     train_state_proj: bool = True
 
     # Training presets

@@ -291,10 +291,13 @@ class TrainPipelineConfig(HubMixin):
             )
 
         if not self.job_name:
-            if self.env is None:
-                self.job_name = f"{active_cfg.type}"
-            else:
-                self.job_name = f"{self.env.type}_{active_cfg.type}"
+            parts = []
+            if self.env is not None:
+                parts.append(self.env.type)
+            if self.dataset is not None:
+                parts.append(self.dataset.repo_id.split("/")[-1])
+            parts.append(active_cfg.type)
+            self.job_name = "_".join(parts)
 
         if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
             raise FileExistsError(
@@ -306,7 +309,7 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
+        if self.dataset is not None and isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):

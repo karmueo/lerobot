@@ -78,6 +78,7 @@ class SmolVLMWithExpertModel(nn.Module):
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
         freeze_vision_encoder: bool = False,
+        train_vlm_layers: int = 0,
         attention_mode: str = "self_attn",
         num_expert_layers: int = -1,
         num_vlm_layers: int = -1,
@@ -142,6 +143,13 @@ class SmolVLMWithExpertModel(nn.Module):
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.train_vlm_layers = train_vlm_layers
+        if self.train_vlm_layers < 0 or self.train_vlm_layers > self.num_vlm_layers:
+            raise ValueError(
+                f"train_vlm_layers must be in [0, {self.num_vlm_layers}], got {self.train_vlm_layers}."
+            )
+        if self.train_expert_only and self.train_vlm_layers:
+            raise ValueError("train_vlm_layers > 0 requires train_expert_only=False.")
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
@@ -158,6 +166,21 @@ class SmolVLMWithExpertModel(nn.Module):
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
+        elif self.train_vlm_layers:
+            # Start from a fully frozen VLM, then opt into a small task-adaptation
+            # surface. The connector is useful for visual-domain adaptation even
+            # when the vision encoder itself stays fixed.
+            self.vlm.eval()
+            for params in self.vlm.parameters():
+                params.requires_grad = False
+            if not self.freeze_vision_encoder:
+                for params in self.get_vlm_model().vision_model.parameters():
+                    params.requires_grad = True
+            for params in self.get_vlm_model().connector.parameters():
+                params.requires_grad = True
+            for layer in self.get_vlm_model().text_model.layers[-self.train_vlm_layers :]:
+                for params in layer.parameters():
+                    params.requires_grad = True
         else:
             # To avoid unused params issue with distributed training
             last_layers = [self.num_vlm_layers - 1]
@@ -198,6 +221,13 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if self.train_expert_only:
             self.vlm.eval()
+        elif self.train_vlm_layers:
+            self.vlm.eval()
+            if not self.freeze_vision_encoder:
+                self.get_vlm_model().vision_model.train(mode)
+            self.get_vlm_model().connector.train(mode)
+            for layer in self.get_vlm_model().text_model.layers[-self.train_vlm_layers :]:
+                layer.train(mode)
 
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None
