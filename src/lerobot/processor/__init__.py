@@ -96,6 +96,18 @@ from .relative_action_processor import (
     to_absolute_actions,
     to_relative_actions,
 )
+from .relative_pose_processor import (
+    RELATIVE_POSE_ANCHOR_KEY,
+    AbsolutePoseProcessorStep,
+    RelativePoseAnchor,
+    RelativePoseProcessorStep,
+    reconnect_relative_pose_steps,
+    relative_pose_model_dim,
+    set_frame_to_identity,
+    to_absolute_pose,
+    to_relative_pose,
+    validate_pose_starts,
+)
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .render_messages_processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
@@ -137,6 +149,16 @@ __all__ = [
     "make_policy_processor_pipelines",
     "AbsoluteActionsProcessorStep",
     "RelativeActionsProcessorStep",
+    "AbsolutePoseProcessorStep",
+    "RelativePoseAnchor",
+    "RelativePoseProcessorStep",
+    "RELATIVE_POSE_ANCHOR_KEY",
+    "reconnect_relative_pose_steps",
+    "relative_pose_model_dim",
+    "set_frame_to_identity",
+    "to_absolute_pose",
+    "to_relative_pose",
+    "validate_pose_starts",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
     "NewLineTaskProcessorStep",

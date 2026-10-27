@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
+from lerobot.processor import validate_pose_starts
 
 
 @PreTrainedConfig.register_subclass("diffusion")
@@ -43,6 +44,14 @@ class DiffusionConfig(PreTrainedConfig):
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
             current step and additional steps going back).
+        use_relative_pose: 是否使用 UMI / FastUMI 风格的 SE(3) 相对位姿：observation.state 历史与 action
+            块都表达为相对当前帧位姿的变换 ``inv(T_cur) @ T``，旋转编码为 rot6d；位姿组以外的维度
+            （如夹爪）保持绝对值。训练时 state/action 的统计量会在相对空间重新计算。
+        relative_pose_state_starts: observation.state 中各位姿组的起始下标，每组 6 维
+            ``[x, y, z, rx, ry, rz]``（轴角）。双臂可写成 ``[0, 7]``。
+        relative_pose_action_starts: action 中各位姿组的起始下标，``None`` 表示与 state 相同。
+            第 i 个动作位姿组相对第 i 个状态位姿组计算。
+        relative_pose_stats_stride: 训练前计算相对空间统计量时的采样步长，数据集很大时可调大以加速。
         horizon: Diffusion model action prediction size as detailed in `DiffusionPolicy.select_action`.
         n_action_steps: The number of action steps to run in the environment for one invocation of the policy.
             See `DiffusionPolicy.select_action` for more details.
@@ -104,6 +113,12 @@ class DiffusionConfig(PreTrainedConfig):
     n_obs_steps: int = 2
     horizon: int = 64
     n_action_steps: int = 32
+
+    # SE(3) 相对位姿（UMI / FastUMI 风格），默认关闭，不影响已有用法
+    use_relative_pose: bool = False
+    relative_pose_state_starts: list[int] = field(default_factory=lambda: [0])
+    relative_pose_action_starts: list[int] | None = None
+    relative_pose_stats_stride: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -203,6 +218,16 @@ class DiffusionConfig(PreTrainedConfig):
         if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
             raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
 
+        if self.use_relative_pose:
+            if not self.relative_pose_state_starts:
+                raise ValueError("`relative_pose_state_starts` must list at least one pose group.")
+            if len(self.resolved_relative_pose_action_starts) != len(self.relative_pose_state_starts):
+                raise ValueError(
+                    "`relative_pose_action_starts` must have as many pose groups as `relative_pose_state_starts`."
+                )
+            if self.relative_pose_stats_stride < 1:
+                raise ValueError("`relative_pose_stats_stride` must be >= 1.")
+
         # Check that the horizon size and U-Net downsampling is compatible.
         # U-Net downsamples by 2 with each stage.
         downsampling_factor = 2 ** len(self.down_dims)
@@ -226,7 +251,44 @@ class DiffusionConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
         )
 
+    @property
+    def resolved_relative_pose_action_starts(self) -> list[int]:
+        """动作位姿组起始下标；未单独指定时与 state 相同。"""
+        if self.relative_pose_action_starts is None:
+            return list(self.relative_pose_state_starts)
+        return list(self.relative_pose_action_starts)
+
+    @property
+    def model_state_dim(self) -> int:
+        """模型实际看到的 state 维度：启用相对位姿时每个位姿组从 6 维扩展为 9 维。"""
+        dim = self.robot_state_feature.shape[0]
+        if self.use_relative_pose:
+            dim += 3 * len(self.relative_pose_state_starts)
+        return dim
+
+    @property
+    def model_action_dim(self) -> int:
+        """模型实际预测的 action 维度：启用相对位姿时每个位姿组从 6 维扩展为 9 维。"""
+        dim = self.action_feature.shape[0]
+        if self.use_relative_pose:
+            dim += 3 * len(self.resolved_relative_pose_action_starts)
+        return dim
+
     def validate_features(self) -> None:
+        if self.use_relative_pose:
+            if self.robot_state_feature is None:
+                raise ValueError("`use_relative_pose` requires `observation.state` as an input feature.")
+            validate_pose_starts(
+                self.relative_pose_state_starts,
+                self.robot_state_feature.shape[0],
+                name="relative_pose_state_starts",
+            )
+            validate_pose_starts(
+                self.resolved_relative_pose_action_starts,
+                self.action_feature.shape[0],
+                name="relative_pose_action_starts",
+            )
+
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 

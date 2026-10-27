@@ -61,6 +61,7 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.compute_stats import compute_relative_pose_stats
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.distributed import (
     ParallelDims,
@@ -77,7 +78,7 @@ from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import ACTION, OBS_STATE, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -381,6 +382,34 @@ def make_dataloaders(
     return dataloader, eval_dataloader
 
 
+def _with_relative_pose_stats(dataset: Any, policy_cfg: Any) -> dict[str, dict[str, Any]]:
+    """返回数据集统计量的副本，其中 state/action 换成 SE(3) 相对位姿空间中的统计量。
+
+    仅支持能提供 ``hf_dataset`` 的数据集（非流式、非 LanceDB 后端）。
+    """
+    try:
+        hf_dataset = dataset.hf_dataset
+    except AttributeError as err:
+        raise ValueError(
+            "`use_relative_pose` needs the full action/state columns to compute relative statistics, "
+            f"but {type(dataset).__name__} does not expose `hf_dataset`."
+        ) from err
+
+    logging.info("Computing observation.state/action statistics in SE(3) relative pose space")
+    relative_stats = compute_relative_pose_stats(
+        hf_dataset,
+        observation_delta_indices=list(policy_cfg.observation_delta_indices),
+        action_delta_indices=list(policy_cfg.action_delta_indices),
+        state_pose_starts=list(policy_cfg.relative_pose_state_starts),
+        action_pose_starts=policy_cfg.relative_pose_action_starts,
+        sample_stride=policy_cfg.relative_pose_stats_stride,
+    )
+    stats = dict(dataset.meta.stats)
+    stats[OBS_STATE] = relative_stats[OBS_STATE]
+    stats[ACTION] = relative_stats[ACTION]
+    return stats
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
     """
@@ -506,7 +535,11 @@ def train(cfg: TrainPipelineConfig):
         processor_pretrained_path = None
 
     processor_kwargs = ProcessorConfigKwargs()
-    processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
+    dataset_stats_for_processors = dataset.meta.stats
+    if getattr(active_cfg, "use_relative_pose", False) and not cfg.resume:
+        # 相对位姿模式下模型看到的是相对当前帧的 rot6d 位姿，归一化统计量必须在相对空间重新计算
+        dataset_stats_for_processors = _with_relative_pose_stats(dataset, active_cfg)
+    processor_dataset_stats = rename_stats(dataset_stats_for_processors, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
     if cfg.is_reward_model_training:

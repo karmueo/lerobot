@@ -35,6 +35,7 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
     batch_to_transition,
     policy_action_to_transition,
+    reconnect_relative_pose_steps,
     transition_to_batch,
     transition_to_policy_action,
 )
@@ -69,6 +70,8 @@ def _reconnect_relative_absolute_steps(
     the RelativeActionsProcessorStep so it can read the cached state at inference time.
     That reference is not serializable, so we re-establish it here after loading.
     """
+    # SE(3) 相对位姿步骤（diffusion 的 use_relative_pose）同样需要重新连接
+    reconnect_relative_pose_steps(preprocessor.steps, postprocessor.steps)
     relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
     if relative_step is None:
         return

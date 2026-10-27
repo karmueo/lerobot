@@ -33,6 +33,7 @@ import torchvision
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from lerobot.processor import RELATIVE_POSE_ANCHOR_KEY
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -112,7 +113,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         if queues_populated:
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         else:
-            batch = dict(batch)
+            batch = {k: v for k, v in batch.items() if k != RELATIVE_POSE_ANCHOR_KEY}
             if self.config.image_features:
                 for key in self.config.image_features:
                     if batch[key].ndim == 4:
@@ -146,24 +147,39 @@ class DiffusionPolicy(PreTrainedPolicy):
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
         if ACTION in batch:
             batch.pop(ACTION)
+        # 相对位姿预处理器写入的参考位姿句柄，不属于模型输入
+        anchor = batch.pop(RELATIVE_POSE_ANCHOR_KEY, None)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+
+        exclude_keys = []
+        state = batch.get(OBS_STATE)
+        if self.config.use_relative_pose and state is not None and state.ndim == 3:
+            # 相对位姿预处理器已给出相对当前帧的完整历史 (B, n_obs_steps, D)，历史帧随当前帧变化，
+            # 不能沿用队列中旧的结果，直接用它覆盖 state 队列
+            self._queues[OBS_STATE].clear()
+            self._queues[OBS_STATE].extend(state.unbind(dim=1))
+            exclude_keys.append(OBS_STATE)
         # NOTE: It's important that this happens after stacking the images into a single key.
-        self._queues = populate_queues(self._queues, batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=exclude_keys)
 
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1))
+            if anchor is not None:
+                # 队列中的动作都相对本次观测的当前帧，锁定该参考位姿供后处理器还原绝对位姿
+                anchor.latch()
 
         action = self._queues[ACTION].popleft()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
+        # 相对位姿预处理器总会写入参考位姿句柄，训练时不需要
+        batch = {k: v for k, v in batch.items() if k != RELATIVE_POSE_ANCHOR_KEY}
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
@@ -194,7 +210,8 @@ class DiffusionModel(nn.Module):
         self.config = config
 
         # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = self.config.robot_state_feature.shape[0]
+        # 启用相对位姿时 state 中每个位姿组扩展为 9 维（位置 + rot6d）
+        global_cond_dim = self.config.model_state_dim
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -246,7 +263,7 @@ class DiffusionModel(nn.Module):
             noise
             if noise is not None
             else torch.randn(
-                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                size=(batch_size, self.config.horizon, self.config.model_action_dim),
                 dtype=dtype,
                 device=device,
                 generator=generator,
@@ -649,7 +666,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
         # just reverse these.
-        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
+        in_out = [(config.model_action_dim, config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
 
@@ -704,7 +721,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         self.final_conv = nn.Sequential(
             DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+            nn.Conv1d(config.down_dims[0], config.model_action_dim, 1),
         )
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:

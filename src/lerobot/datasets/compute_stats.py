@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import torch
 
 from lerobot.configs import is_depth_map
-from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor import RelativeActionsProcessorStep, set_frame_to_identity, to_relative_pose
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -782,4 +783,113 @@ def compute_relative_action_stats(
         f"q01={stats['q01'].mean():.4f}, q99={stats['q99'].mean():.4f}"
     )
 
+    return stats
+
+
+def _episode_row_bounds(episode_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """为每一行返回其所在回合的 [起始行, 结束行)。假设同一回合的行连续存放。"""
+    total = len(episode_indices)
+    change = np.flatnonzero(np.diff(episode_indices)) + 1
+    starts = np.concatenate([[0], change])
+    ends = np.concatenate([change, [total]])
+    lengths = ends - starts
+    return np.repeat(starts, lengths), np.repeat(ends, lengths)
+
+
+def _floor_stat_ranges(stats: dict[str, np.ndarray], min_range: float) -> dict[str, np.ndarray]:
+    """给近常量维度的统计范围设下限，避免归一化把浮点误差放大。
+
+    - min/max 及 q01/q99、q10/q90：范围小于 ``min_range`` 时以中点为中心扩展到 ``min_range``，
+      常量值归一化后落在 0 附近，1e-7 量级的误差只会变成 1e-3 量级。
+    - std：取 ``max(std, min_range)``。
+    """
+    out = dict(stats)
+    for low_key, high_key in (("min", "max"), ("q01", "q99"), ("q10", "q90")):
+        if low_key not in out or high_key not in out:
+            continue
+        low, high = out[low_key].astype(np.float64), out[high_key].astype(np.float64)
+        narrow = (high - low) < min_range
+        center = (high + low) / 2.0
+        out[low_key] = np.where(narrow, center - min_range / 2.0, low)
+        out[high_key] = np.where(narrow, center + min_range / 2.0, high)
+    if "std" in out:
+        out["std"] = np.maximum(out["std"], min_range)
+    return out
+
+
+def compute_relative_pose_stats(
+    hf_dataset,
+    observation_delta_indices: list[int],
+    action_delta_indices: list[int],
+    state_pose_starts: list[int],
+    action_pose_starts: list[int] | None = None,
+    batch_size: int = 2048,
+    sample_stride: int = 1,
+    min_range: float = 1e-4,
+) -> dict[str, dict[str, np.ndarray]]:
+    """在 SE(3) 相对位姿（rot6d）空间中计算 ``observation.state`` 与 ``action`` 的归一化统计量。
+
+    逐帧复现训练时的采样方式：按 delta indices 取观测历史和动作块（越过回合边界时复制边界帧，
+    与 ``LeRobotDataset`` 的填充一致），以 delta 0 帧为当前帧做 ``RelativePoseProcessorStep``
+    同样的转换，再对时间维展平后统计每一维。
+
+    转换使用与训练相同的 float32 精度，当前帧写成精确单位位姿（与处理步骤一致），
+    并对近常量维度的统计范围设下限（例如 ``n_obs_steps=1`` 时 state 的位姿维度恒为单位位姿）。
+
+    Args:
+        hf_dataset: 含 ``observation.state``、``action``、``episode_index`` 列的 HF 数据集。
+        observation_delta_indices: 策略的观测帧偏移，例如 diffusion 的 ``[-1, 0]``，必须包含 0。
+        action_delta_indices: 策略的动作帧偏移，例如 ``[-1, 0, ..., horizon - 2]``。
+        state_pose_starts: state 中各位姿组（位置 + 轴角，6 维）的起始下标。
+        action_pose_starts: action 中各位姿组的起始下标，``None`` 表示与 state 相同。
+        batch_size: 每批处理的样本（当前帧）数，控制内存占用。
+        sample_stride: 当前帧的采样步长，大于 1 时只统计部分样本以加速。
+        min_range: 统计范围（max - min、分位数区间、std）的下限，用于近常量维度。
+
+    Returns:
+        ``{"observation.state": stats, "action": stats}``，每项含 min/max/mean/std/count 与分位数。
+    """
+    if 0 not in observation_delta_indices:
+        raise ValueError("observation_delta_indices must contain 0 (the current frame).")
+    if action_pose_starts is None:
+        action_pose_starts = state_pose_starts
+
+    # 与训练时一致使用 float32 做位姿转换；RunningQuantileStats 内部仍以 float64 累加
+    all_states = np.asarray(hf_dataset[OBS_STATE], dtype=np.float32)
+    all_actions = np.asarray(hf_dataset[ACTION], dtype=np.float32)
+    current_frame = observation_delta_indices.index(0)
+    episode_indices = np.asarray(hf_dataset["episode_index"])
+    row_start, row_end = _episode_row_bounds(episode_indices)
+
+    obs_offsets = np.asarray(observation_delta_indices)
+    act_offsets = np.asarray(action_delta_indices)
+    sample_rows = np.arange(0, len(all_states), max(sample_stride, 1))
+
+    state_stats = RunningQuantileStats()
+    action_stats = RunningQuantileStats()
+    for begin in range(0, len(sample_rows), batch_size):
+        rows = sample_rows[begin : begin + batch_size]
+        lower, upper = row_start[rows, None], row_end[rows, None] - 1
+        obs_rows = np.clip(rows[:, None] + obs_offsets[None, :], lower, upper)
+        act_rows = np.clip(rows[:, None] + act_offsets[None, :], lower, upper)
+
+        current = torch.from_numpy(all_states[rows])
+        rel_states = to_relative_pose(
+            torch.from_numpy(all_states[obs_rows]), current, state_pose_starts, state_pose_starts
+        )
+        rel_states = set_frame_to_identity(rel_states, current_frame, state_pose_starts)
+        rel_actions = to_relative_pose(
+            torch.from_numpy(all_actions[act_rows]), current, action_pose_starts, state_pose_starts
+        )
+        state_stats.update(rel_states.reshape(-1, rel_states.shape[-1]).numpy())
+        action_stats.update(rel_actions.reshape(-1, rel_actions.shape[-1]).numpy())
+
+    stats = {
+        OBS_STATE: _floor_stat_ranges(state_stats.get_statistics(), min_range),
+        ACTION: _floor_stat_ranges(action_stats.get_statistics(), min_range),
+    }
+    logging.info(
+        f"Relative pose stats over {len(sample_rows)} samples: "
+        f"state dim={stats[OBS_STATE]['mean'].shape[0]}, action dim={stats[ACTION]['mean'].shape[0]}"
+    )
     return stats
