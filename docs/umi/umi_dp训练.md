@@ -50,7 +50,17 @@ uv run torchrun --nproc-per-node=2 $(uv run which lerobot-train) \
 
 单卡训练时，把开头换成 `uv run lerobot-train`，其余参数不变。
 
-### 2.1 如何算出 `--steps`
+### 2.1 使用配置文件调整 DP 模型
+
+从仓库根目录执行训练命令时，可以加入以下参数，加载 [dp_fastumi_config.json](./dp_fastumi_config.json)：
+
+```bash
+--config_path=docs/umi/dp_fastumi_config.json \
+```
+
+该文件将 U-Net 通道数设为 `[256, 512, 1024]`，并使用 DDIM、50 个训练扩散时间步和 16 个推理去噪步。它只配置这些策略参数，上面的数据集、相对位姿、时序和训练参数仍需保留。`--config_path` 中的相对路径以执行命令时所在的目录为准；从其他目录启动时，可改用配置文件的绝对路径。
+
+### 2.2 如何算出 `--steps`
 
 ```
 总 batch  = batch_size × GPU 数 × 梯度累积步数
@@ -62,7 +72,7 @@ steps     = 目标 epoch 数 × 数据集总帧数 / 总 batch
 
 训练日志中的 `epch:` 字段就是当前已训练的 epoch 数，可以用来核对。
 
-### 2.2 训练输出
+### 2.3 训练输出
 
 ```
 outputs/train/<job>/
@@ -123,7 +133,7 @@ outputs/train/<job>/
 | 参数 | 本例取值 | 含义 | 调参建议 |
 |---|---|---|---|
 | `--batch_size` | `128` | **每张卡**的 batch 大小 | 5090（32GB）上，每卡 128 实测约用 10.4GB 显存。每卡 192 也能放下，256 有 OOM 风险 |
-| `--steps` | `18500` | 总优化步数。学习率按余弦曲线在这些步内衰减到 0 | 按 2.1 节的公式从目标 epoch 数换算。见第 4 节的经验数据 |
+| `--steps` | `18500` | 总优化步数。学习率按余弦曲线在这些步内衰减到 0 | 按 2.2 节的公式从目标 epoch 数换算。见第 4 节的经验数据 |
 | `--policy.optimizer_lr` | 默认 `1e-4` | 学习率 | **注意**：默认会使用 policy 自带的训练预设，`--optimizer.lr` 会被覆盖、不起作用，所以改学习率要用这个参数。把总 batch 加大好几倍时，可以试 `2e-4` |
 | `--policy.scheduler_warmup_steps` | 默认 `500` | 学习率预热步数 | 一般不用改 |
 | `--save_freq` | `0` | 每隔多少步保存一次 checkpoint。设为 0 时只在最后保存一次 | 调参阶段建议设 `2000`，以便比较不同步数的效果；正式训练可以设为 0，或设得比较稀疏 |

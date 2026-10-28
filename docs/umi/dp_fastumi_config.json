@@ -1,0 +1,9 @@
+{
+  "policy": {
+    "type": "diffusion",
+    "down_dims": [256, 512, 1024],
+    "noise_scheduler_type": "DDIM",
+    "num_train_timesteps": 50,
+    "num_inference_steps": 16
+  }
+}
