@@ -89,7 +89,8 @@ class DatasetConfig:
 
 @dataclass
 class WandBConfig:
-    enable: bool = False
+    # 默认开启 wandb 记录；不需要时用 --wandb.enable=false 关闭
+    enable: bool = True
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
     disable_artifact: bool = False
     project: str = "lerobot"
@@ -97,7 +98,9 @@ class WandBConfig:
     notes: str | None = None
     run_id: str | None = None
     resume: str | None = None  # Allowed values: 'allow', 'must', 'never', or 'auto'.
-    mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
+    # 可选 'online'、'offline'、'disabled'；默认离线，日志写到 <output_dir>/wandb，
+    # 事后用 `wandb sync <output_dir>/wandb/offline-run-*` 上传，None 或非法值按 'online' 处理
+    mode: str | None = "offline"
     console: str = "wrap"
     console_multipart: bool = False
     console_chunk_max_seconds: int = 0

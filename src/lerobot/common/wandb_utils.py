@@ -123,8 +123,15 @@ class WandBLogger:
         cfg.wandb.run_id = run_id
         # Handle custom step key for rl asynchronous training.
         self._wandb_custom_step_key: set[str] | None = None
-        logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
-        logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
+        if wandb.run.settings.mode == "offline":
+            # 离线模式没有网页链接，提示本地日志位置和上传命令
+            logging.info(colored("WandB offline mode: logs are stored locally.", "blue", attrs=["bold"]))
+            # run.dir 指向 offline-run-*/files，wandb sync 需要它的上一级目录
+            sync_cmd = f"wandb sync {os.path.dirname(wandb.run.dir)}"
+            logging.info(f"Sync later with --> {colored(sync_cmd, 'yellow', attrs=['bold'])}")
+        else:
+            logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
+            logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
         self._wandb = wandb
 
     def log_policy(self, checkpoint_dir: Path):
