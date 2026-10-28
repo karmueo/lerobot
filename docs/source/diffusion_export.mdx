@@ -1,0 +1,142 @@
+# Diffusion 模型导出与验证
+
+`lerobot-export` 将本地训练好的 Diffusion Policy 导出为两个固定 batch=1 的 ONNX 图，并可构建 TensorRT engine。
+支持普通 Diffusion、UMI 相对位姿以及检查点原有的 DDPM/DDIM 配置；不会自动减少采样步数。
+
+## 安装依赖
+
+在仓库根目录执行：
+
+```bash
+uv sync --locked --inexact --extra diffusion --extra dataset --extra export --extra export-tensorrt
+```
+
+仅需 ONNX 时去掉 `--extra export-tensorrt`。TensorRT 首版支持 Linux x86-64、NVIDIA GPU、
+`tensorrt-cu12==10.13.3.*`；仓库将 SDK 二进制包绑定到 NVIDIA 官方索引。
+ONNX Runtime 使用 CPU 包验证，不需要安装 `onnxruntime-gpu`、`trtexec` 或 PyCUDA。
+
+## 导出指定检查点
+
+```bash
+uv run --no-sync lerobot-export \
+  --policy_path=outputs/train/dp_umi_v4/checkpoints/012000/pretrained_model \
+  --output_dir=outputs/export/dp_umi_v4/012000 \
+  --format=both --device=cuda:0 --trt_precision=both
+```
+
+`--format=onnx` 仅导出 ONNX；`--format=tensorrt` 会先导出并保留 ONNX，再构建 engine。
+`--trt_precision` 可取 `fp32`、`fp16` 或 `both`。仅导出 ONNX 时可使用 `--device=cpu`。
+输出已存在时默认报错，确认需要重新构建后使用 `--overwrite=true`。
+
+模型包包含 `encoder.onnx`、`denoiser.onnx`、各精度的 engine、`manifest.json` 和 `assets/`。
+ONNX 如产生外部权重文件，必须随包保留。`assets/` 保存配置、调度器、原有处理器和统计量。
+manifest 记录接口、相机顺序、动作切片、文件摘要、检查点指纹以及 TensorRT 构建设备。
+engine 不作为跨设备通用文件；更换 GPU 型号或 TensorRT 版本时应重新构建。
+
+## 独立验证与性能测试
+
+默认命令使用上面的检查点和产物目录，从 `train_config.json` 读取本地训练数据路径：
+
+```bash
+uv run --no-sync lerobot-validate-export
+```
+
+验证不会重新导出或构建。切换模型时显式指定目录：
+
+```bash
+uv run --no-sync lerobot-validate-export \
+  --policy_path=/path/to/pretrained_model \
+  --export_dir=/path/to/export \
+  --dataset_root=/path/to/lerobot_dataset
+```
+
+默认选择前四个满足长度要求的 episode，各八个有效窗口，种子为 0、1、2；另测每个 episode 起点。
+原生 PyTorch、导出包装和导出后端使用相同设备的局部随机数生成器，完整对齐 DDPM 每步方差噪声。
+数据只解码一次，不启用训练增强，使用检查点保存的统计量和共享位姿 anchor。
+
+只验证 ONNX 或 TensorRT FP32：
+
+```bash
+uv run --no-sync lerobot-validate-export --backends='[onnx]' --benchmark=false
+uv run --no-sync lerobot-validate-export --backends='[tensorrt_fp32]'
+```
+
+报告写入 `validation_report.json`，每次验证都会更新此报告。保留不同运行记录时先复制报告。
+某后端失败会保留该后端错误及其他后端结果，并返回非零退出码。
+FP16 精度不达标时不会自动放宽阈值或用 FP32 的结果冒充通过；FP32 engine 仍可使用。
+
+默认绝对动作精度门槛：位置欧氏距离 ≤1mm、SO(3) 旋转角 ≤0.5°、夹爪绝对差 ≤0.01。
+这些是相对于原模型的转换误差标准，不等于实际任务成功率或机器人控制安全认证。
+默认 UMI 数据集提供米、弧度和归一化夹爪单位；其他数据集须通过 metadata 或
+`--position_unit=m --rotation_unit=rad --gripper_representation=normalized_0_1` 明确该约定。
+物理验收当前支持每个 6D 位姿组对应一个夹爪维度；其他动作布局仍可导出，但不能套用此物理验收。
+
+GPU 性能测试预热 10 次、测量 100 次，包含前处理、编码、完整采样、后处理与传输，不含解码、加载与构建。
+P50/P95 使用 CUDA 同步后的完整调用时间；阶段耗时另行采集，避免额外同步影响完整调用统计。
+显存使用整卡 10ms 采样峰值，包含 TensorRT 原生分配、参考模型及其他进程，因此不是部署独占显存。
+ORT CPU 的验证延迟另列，包含 CPU 网络与参考设备调度器之间的搬运，不参与 GPU 加速比。
+
+## 模型包的运行边界
+
+两个网络只处理预处理后的张量：编码器输出 conditioning，去噪器输出单步预测值。
+完整推理仍需 Python、PyTorch/diffusers 调度器及现有前后处理。模型包不需要原始 `model.safetensors`
+即可运行，但参考精度验证仍需原始检查点。
+
+默认 UMI 模型的接口为：
+
+| 阶段                    | 形状                |
+| ----------------------- | ------------------- |
+| 原始状态历史            | `[1,2,7]`           |
+| 相对位姿状态            | `[1,2,10]`          |
+| 编码器图像              | `[1,2,1,3,224,224]` |
+| conditioning            | `[1,148]`           |
+| U-Net sample/prediction | `[1,16,10]`         |
+| timestep                | `[1]` int64         |
+| 后处理动作块            | `[1,8,7]`           |
+
+其他模型维度从配置生成，不应硬编码为上述数值。相机顺序和输入名称以 manifest 为准。
+新 episode 调用运行器 `reset()`；一个观测窗口的后处理必须在切换窗口前完成。
+
+## 回归测试
+
+```bash
+uv sync --locked --inexact --extra diffusion --extra export --extra test
+uv run --no-sync pytest tests/policies/test_diffusion_export.py \
+  tests/processor/test_diffusion_processor.py tests/processor/test_relative_pose_processor.py -q
+```
+
+如果主机系统 ROS 的旧 pytest 插件与当前 pytest 不兼容，可加 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。
+小模型测试不依赖真实检查点、数据集或 CUDA；TensorRT 的真实构建与推理通过独立验证命令验收。
+
+## 默认检查点的实测结果
+
+2026-10-28，在 RTX 5090（`cuda:1`）上验证 `dp_umi_v4/012000`，保持 batch=1、DDPM 100 步和 8 步动作块。
+软件版本为 PyTorch 2.11.0+cu128、ONNX 1.22.0、ONNX Runtime 1.29.0、diffusers 0.39.0、TensorRT 10.13.3.9。
+
+复现命令：
+
+```bash
+OMP_NUM_THREADS=4 uv run --no-sync lerobot-validate-export --device=cuda:1
+```
+
+GPU 性能结果（各预热 10 次、测量 100 次）：
+
+| 后端          | 完整调用 P50 |        P95 | P50 加速比 | 整卡显存采样峰值 |
+| ------------- | -----------: | ---------: | ---------: | ---------------: |
+| PyTorch FP32  |   1150.24 ms | 1150.72 ms |      1.00× |         2863 MiB |
+| TensorRT FP32 |    363.40 ms |  363.65 ms |      3.17× |         3929 MiB |
+| TensorRT FP16 |     77.82 ms |   86.30 ms |     14.78× |         3405 MiB |
+
+显存包含验证程序保留的参考模型，不能据此推断独立部署显存。ORT CPU 的 108 次验证调用 P50 为
+3123.98 ms、P95 为 3159.04 ms，其中调度器仍在 GPU 上执行，包含数据传输，不与 GPU 后端计算加速比。
+
+32 个常规窗口加 4 个 episode 起点、每窗口 3 个种子，共 108 组采样的最大绝对动作误差：
+
+| 后端          |    最大位置差 |  最大旋转差 |   最大夹爪差 | 结论 |
+| ------------- | ------------: | ----------: | -----------: | ---- |
+| ONNX FP32     |  0.0001042 mm | 0.00001046° | 0.0000001192 | 通过 |
+| TensorRT FP32 | 0.00008697 mm | 0.00001145° | 0.0000001192 | 通过 |
+| TensorRT FP16 |     0.1452 mm |    0.02185° |    0.0002945 | 通过 |
+
+完整逐窗口网络误差、动作分布、阶段耗时及版本信息保存在模型包的 `validation_report.json`。
+这些结果只描述该检查点、设备和采样配置，更换模型后应重新验证。

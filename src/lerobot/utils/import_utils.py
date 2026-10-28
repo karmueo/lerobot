@@ -115,6 +115,10 @@ _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
 _scipy_available = is_package_available("scipy")
 _diffusers_available = is_package_available("diffusers")
+# 导出工具按需加载，发行包名与 TensorRT 的实际导入名不同。
+_onnx_available = is_package_available("onnx")
+_onnxruntime_available = is_package_available("onnxruntime")
+_tensorrt_available = is_package_available("tensorrt-cu12", import_name="tensorrt")
 _torchdiffeq_available = is_package_available("torchdiffeq")
 
 # Hardware SDKs

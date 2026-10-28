@@ -97,6 +97,8 @@
 - sections:
   - local: inference
     title: Policy Deployment (lerobot-rollout)
+  - local: diffusion_export
+    title: Diffusion ONNX and TensorRT Export
   - local: async
     title: Use Async Inference
   - local: rtc

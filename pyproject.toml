@@ -93,6 +93,15 @@ dependencies = [
 # Optional dependencies
 [project.optional-dependencies]
 
+# 模型导出与 CPU 数值验证；TensorRT 单独选择，避免普通安装下载 GPU SDK。
+export = ["onnx>=1.17,<2", "onnxruntime>=1.20,<2"]
+export-tensorrt = [
+    "lerobot[export]",
+    "tensorrt-cu12==10.13.3.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu12-libs==10.13.3.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu12-bindings==10.13.3.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 # ── Feature-scoped extras ──────────────────────────────────
 lancedb = [
     "lerobot[dataset]",
@@ -353,6 +362,8 @@ all = [
 ]
 
 [project.scripts]
+lerobot-export="lerobot.scripts.lerobot_export:main"
+lerobot-validate-export="lerobot.scripts.lerobot_validate_export:main"
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
@@ -387,6 +398,14 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+# 直接使用 NVIDIA 官方 wheel，避免 PyPI 占位包在构建期间再次下载 SDK。
+tensorrt-cu12-libs = { index = "nvidia" }
+tensorrt-cu12-bindings = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
