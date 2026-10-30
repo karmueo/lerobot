@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""验证已导出的 Diffusion 模型包，不重复构建 engine."""
+"""验证已导出的 ACT 或 Diffusion 模型包，不重复构建 engine."""
 
 from lerobot.configs import parser
 from lerobot.export.validation import ValidationConfig, validate_export

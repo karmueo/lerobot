@@ -162,19 +162,30 @@ def load_windows(cfg: ValidationConfig, policy_cfg):
         indices = np.linspace(low, high, cfg.windows_per_episode, dtype=int).tolist()
         windows.extend(decode(index) for index in indices)
         boundary = decode(first)
-        # 起点历史必须重复本 episode 首帧，而不是借用上一 episode 的观测。
-        for key, value in boundary.items():
-            if value.shape[1] != policy_cfg.n_obs_steps or not all(
-                torch.equal(value[:, i], value[:, -1]) for i in range(policy_cfg.n_obs_steps)
-            ):
-                raise ValueError(f"Episode-start padding mismatch: {episode['episode_index']}, {key}")
+        # 多帧观测的起点历史必须重复本 episode 首帧；ACT 单帧不带时间维。
+        if policy_cfg.n_obs_steps > 1:
+            for key, value in boundary.items():
+                if value.shape[1] != policy_cfg.n_obs_steps or not all(
+                    torch.equal(value[:, i], value[:, -1]) for i in range(policy_cfg.n_obs_steps)
+                ):
+                    raise ValueError(f"Episode-start padding mismatch: {episode['episode_index']}, {key}")
         boundaries.append(boundary)
         identities.append({"episode": int(episode["episode_index"]), "indices": indices, "start": first})
         if len(identities) == cfg.episodes:
             break
     if len(identities) != cfg.episodes:
         raise ValueError(f"Not enough episodes for requested validation: {len(identities)}")
-    return windows, boundaries, {"root": str(root), "units": units, "windows": identities}
+    return (
+        windows,
+        boundaries,
+        {
+            "root": str(root),
+            "units": units,
+            "action_layout": metadata.get("action_layout"),
+            "pose_frame": metadata.get("pose_frame"),
+            "windows": identities,
+        },
+    )
 
 
 class DeviceMemoryMonitor:
@@ -260,6 +271,12 @@ def validate_export(cfg: ValidationConfig) -> dict:
         or file_hash(cfg.policy_path / "config.json") != manifest["config_sha256"]
     ):
         raise ValueError("Reference checkpoint does not match exported package")
+    if manifest.get("policy_type") == "act":
+        from .validation_act import validate_act_export
+
+        return validate_act_export(cfg, manifest)
+    if manifest.get("policy_type") != "diffusion":
+        raise ValueError("Unsupported export package policy type")
     policy = load_policy(cfg.policy_path, cfg.device)
     pre, post = load_processors(cfg.policy_path, policy.config, cfg.device)
     windows, boundaries, dataset_info = load_windows(cfg, policy.config)

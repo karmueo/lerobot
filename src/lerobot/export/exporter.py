@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from lerobot.policies.diffusion.export_diffusion import make_export_modules
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.export_act import act_inputs, make_export_modules as make_act_export_modules
+from lerobot.policies.diffusion.export_diffusion import make_export_modules as make_diffusion_export_modules
 from lerobot.utils.import_utils import _onnx_available, require_package
 
 from .backends import build_engine
@@ -51,7 +53,7 @@ def tensor_spec(tensor: torch.Tensor) -> dict:
 
 
 def export_policy(cfg: ExportConfig) -> Path:
-    """导出配置驱动的 Diffusion 包，错误时保留之前的有效产物."""
+    """导出配置驱动的策略包，错误时保留之前的有效产物."""
     if cfg.format not in {"onnx", "tensorrt", "both"}:
         raise ValueError("format must be onnx, tensorrt or both")
     if cfg.trt_precision not in {"fp32", "fp16", "both"}:
@@ -69,12 +71,15 @@ def export_policy(cfg: ExportConfig) -> Path:
         raise ValueError("TensorRT export requires a CUDA device")
     require_package("onnx", extra="export")
     assets = processor_assets(source)
-    policy = load_policy(source, cfg.device)
-    pre, post = load_processors(source, policy.config, cfg.device)
-    modules = make_export_modules(policy)
+    # ACT 使用 CPU 追踪以规避旧 ONNX 导出器混合 CPU/CUDA 常量折叠；engine 仍在目标 GPU 构建。
+    trace_device = "cpu" if read_json(source / "config.json").get("type") == "act" else cfg.device
+    policy = load_policy(source, trace_device)
+    pre, post = load_processors(source, policy.config, trace_device)
+    is_act = isinstance(policy.config, ACTConfig)
+    modules = make_act_export_modules(policy) if is_act else make_diffusion_export_modules(policy)
     # 在写任何产物前确认保存的处理器与模型内部维度兼容。
     raw = {
-        name: torch.zeros(1, policy.config.n_obs_steps, *feature.shape)
+        name: torch.zeros(1, *(() if is_act else (policy.config.n_obs_steps,)), *feature.shape)
         for name, feature in policy.config.input_features.items()
     }
     rename = next(
@@ -87,12 +92,21 @@ def export_policy(cfg: ExportConfig) -> Path:
     )
     inverse = {new: old for old, new in rename.items()}
     raw = {inverse.get(name, name): value for name, value in raw.items()}
-    prepared = encoder_inputs(pre(raw), policy.config)
-    for name, sample in zip(modules["encoder"][2], modules["encoder"][1], strict=True):
+    prepared_batch = pre(raw)
+    prepared = (
+        act_inputs(prepared_batch, policy.config) if is_act else encoder_inputs(prepared_batch, policy.config)
+    )
+    stage = "policy" if is_act else "encoder"
+    for name, sample in zip(modules[stage][2], modules[stage][1], strict=True):
         if prepared[name].shape != sample.shape or prepared[name].dtype != sample.dtype:
             raise ValueError(f"Checkpoint processor/model interface mismatch: {name}")
     restored = post(
-        torch.zeros(1, policy.config.n_action_steps, policy.config.model_action_dim, device=cfg.device)
+        torch.zeros(
+            1,
+            policy.config.n_action_steps,
+            policy.config.action_feature.shape[0] if is_act else policy.config.model_action_dim,
+            device=trace_device,
+        )
     )
     if list(restored.shape) != [1, policy.config.n_action_steps, policy.config.action_feature.shape[0]]:
         raise ValueError("Checkpoint action postprocessor shape mismatch")
@@ -103,11 +117,12 @@ def export_policy(cfg: ExportConfig) -> Path:
         package_assets.mkdir()
         for name in assets:
             shutil.copy2(source / name, package_assets / name)
-        write_json(package_assets / "scheduler.json", dict(policy.diffusion.noise_scheduler.config))
+        if not is_act:
+            write_json(package_assets / "scheduler.json", dict(policy.diffusion.noise_scheduler.config))
         manifest = {
             "schema_version": 1,
             "status": "building",
-            "policy_type": "diffusion",
+            "policy_type": "act" if is_act else "diffusion",
             "batch_size": 1,
             "checkpoint": str(source),
             "checkpoint_sha256": file_hash(source / "model.safetensors"),
@@ -118,13 +133,19 @@ def export_policy(cfg: ExportConfig) -> Path:
             "image_features": list(policy.config.image_features),
             "raw_state_dim": policy.config.robot_state_feature.shape[0],
             "raw_action_dim": policy.config.action_feature.shape[0],
-            "model_state_dim": policy.config.model_state_dim,
-            "model_action_dim": policy.config.model_action_dim,
+            "model_state_dim": policy.config.robot_state_feature.shape[0]
+            if is_act
+            else policy.config.model_state_dim,
+            "model_action_dim": policy.config.action_feature.shape[0]
+            if is_act
+            else policy.config.model_action_dim,
             "action_slice": [
-                policy.config.n_obs_steps - 1,
-                policy.config.n_obs_steps - 1 + policy.config.n_action_steps,
+                0 if is_act else policy.config.n_obs_steps - 1,
+                policy.config.n_action_steps
+                if is_act
+                else policy.config.n_obs_steps - 1 + policy.config.n_action_steps,
             ],
-            "num_inference_steps": policy.diffusion.num_inference_steps,
+            "num_inference_steps": 1 if is_act else policy.diffusion.num_inference_steps,
             "stages": {},
         }
         for stage, (module, inputs, names, output_name) in modules.items():
@@ -154,7 +175,7 @@ def export_policy(cfg: ExportConfig) -> Path:
                 for precision in precisions:
                     logging.info("Building %s TensorRT %s", stage, precision)
                     engine_path = root / f"{stage}_{precision}.engine"
-                    info = build_engine(path, engine_path, precision, cfg.device)
+                    info = build_engine(path, engine_path, precision, cfg.device, act_safe_fp16=is_act)
                     spec["engines"][precision] = {"path": engine_path.name, **info}
         manifest["files"] = {
             p.relative_to(root).as_posix(): file_hash(p) for p in sorted(root.rglob("*")) if p.is_file()
@@ -163,8 +184,8 @@ def export_policy(cfg: ExportConfig) -> Path:
         write_json(root / "manifest.json", manifest)
         if output.exists():
             # 先完成新包，再替换旧包；构建失败不会破坏原有成果。
-            if read_json(output / "manifest.json").get("policy_type") != "diffusion":
-                raise ValueError("Existing directory is not a Diffusion export package")
+            if read_json(output / "manifest.json").get("policy_type") != manifest["policy_type"]:
+                raise ValueError("Existing export package has a different policy type")
             with tempfile.TemporaryDirectory(prefix=f".{output.name}-backup-", dir=output.parent) as backup:
                 previous = Path(backup) / "previous"
                 output.replace(previous)

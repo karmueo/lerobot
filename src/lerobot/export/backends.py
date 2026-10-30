@@ -41,7 +41,9 @@ def require_tensorrt() -> None:
         raise RuntimeError("TensorRT requires a CUDA GPU")
 
 
-def build_engine(onnx_path: Path, output: Path, precision: str, device: str) -> dict:
+def build_engine(
+    onnx_path: Path, output: Path, precision: str, device: str, *, act_safe_fp16: bool = False
+) -> dict:
     """用 Python API 构建固定形状 engine，保留解析错误且不写入失败产物."""
     require_tensorrt()
     if precision not in {"fp32", "fp16"}:
@@ -59,11 +61,50 @@ def build_engine(onnx_path: Path, output: Path, precision: str, device: str) -> 
         config.clear_flag(trt.BuilderFlag.TF32)
         if precision == "fp16":
             config.set_flag(trt.BuilderFlag.FP16)
+            if act_safe_fp16:
+                # ACT 混合精度保留视觉残差块、Transformer 和动作头为 FP32；其余层可用 FP16。
+                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                sensitive = {
+                    trt.LayerType.MATRIX_MULTIPLY,
+                    trt.LayerType.NORMALIZATION,
+                    trt.LayerType.SOFTMAX,
+                    trt.LayerType.ELEMENTWISE,
+                    trt.LayerType.ACTIVATION,
+                    trt.LayerType.CONVOLUTION,
+                }
+                protected_layers = 0
+                for index in range(network.num_layers):
+                    layer = network.get_layer(index)
+                    if layer.type in sensitive and layer.name.startswith(
+                        (
+                            "/model/encoder/",
+                            "/model/decoder/",
+                            "/model/action_head/",
+                            "/model/backbone/layer1/",
+                            "/model/backbone/layer2/",
+                            "/model/backbone/layer3/",
+                            "/model/backbone/layer4/",
+                            "/model/encoder_img_feat_input_proj/",
+                        )
+                    ):
+                        protected_layers += 1
+                        layer.precision = trt.float32
+                        for output_index in range(layer.num_outputs):
+                            tensor = layer.get_output(output_index)
+                            if tensor is not None and tensor.dtype == trt.float32:
+                                layer.set_output_type(output_index, trt.float32)
+                if not protected_layers:
+                    raise RuntimeError("Could not identify ACT layers for FP32 precision")
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
             raise RuntimeError(f"TensorRT build failed: {onnx_path.name} ({precision})")
         output.write_bytes(bytes(serialized))
-    return {"tensorrt": trt.__version__, "gpu": gpu_identity(device), "precision": precision}
+    return {
+        "tensorrt": trt.__version__,
+        "gpu": gpu_identity(device),
+        "precision": precision,
+        "act_safe_fp16": act_safe_fp16 and precision == "fp16",
+    }
 
 
 def check_inputs(inputs: dict, spec: dict) -> None:

@@ -161,7 +161,7 @@ def test_invalid_assets_and_policy(tmp_path):
     (tmp_path / filename).unlink()
     with pytest.raises(FileNotFoundError):
         processor_assets(tmp_path)
-    (tmp_path / "config.json").write_text('{"type":"act"}')
+    (tmp_path / "config.json").write_text('{"type":"unsupported"}')
     with pytest.raises(NotImplementedError):
         load_policy(tmp_path, "cpu")
 

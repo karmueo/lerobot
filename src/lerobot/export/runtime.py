@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from lerobot.policies.act.export_act import act_inputs
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -117,3 +118,47 @@ class ExportedDiffusion:
         result = self.post(actions.clone())
         mark("postprocess_ms", start)
         return result, actions, cond, timings
+
+
+class ExportedACT:
+    """ACT 模型包运行器；输入为原始观测，输出为反归一化动作块."""
+
+    def __init__(self, root: Path, session, device: str, manifest: dict | None = None):
+        """仅使用包内配置与统计量，不再加载原始 PyTorch 权重."""
+        self.manifest = manifest if manifest is not None else load_manifest(root)
+        if self.manifest.get("policy_type") != "act":
+            raise ValueError("Expected an ACT export package")
+        self.config = load_config(root / "assets", device)
+        self.pre, self.post = load_processors(root / "assets", self.config, device)
+        self.session, self.device = session, device
+
+    def reset(self) -> None:
+        """独立窗口或新 episode 开始时重置处理器状态."""
+        self.pre.reset()
+        self.post.reset()
+
+    @torch.inference_mode()
+    def predict_chunk(self, raw: dict, seed: int = 0, profile: bool = False):
+        """返回全部预测动作；seed 仅用于兼容统一评测接口，ACT 推理是确定性的."""
+        timings = {}
+
+        def mark(name, started):
+            if profile:
+                synchronize(self.device)
+                timings[name] = (time.perf_counter() - started) * 1000
+            return time.perf_counter()
+
+        started = time.perf_counter()
+        inputs = act_inputs(self.pre(dict(raw)), self.config)
+        started = mark("preprocess_ms", started)
+        actions = self.session.run("policy", inputs)
+        started = mark("policy_ms", started)
+        result = self.post(actions.clone())
+        mark("postprocess_ms", started)
+        return result, actions, None, timings
+
+    def predict(self, raw: dict, seed: int = 0, profile: bool = False):
+        """返回配置中可连续执行的前 n_action_steps 个目标，不维护动作队列."""
+        result, normalized, _, timings = self.predict_chunk(raw, seed, profile)
+        start, end = self.manifest["action_slice"]
+        return result[:, start:end], normalized[:, start:end], None, timings

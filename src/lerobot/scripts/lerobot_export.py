@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""将本地 Diffusion 检查点导出为可验证的双网络模型包."""
+"""将本地 ACT 或 Diffusion 检查点导出为可验证模型包。"""
 
 from lerobot.configs import parser
 from lerobot.export.exporter import ExportConfig, export_policy

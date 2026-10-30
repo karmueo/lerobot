@@ -19,7 +19,10 @@ from pathlib import Path
 
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
@@ -46,30 +49,29 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_config(root: Path, device: str) -> DiffusionConfig:
-    """只接受本地 Diffusion 配置，不通过 Hub 自动补齐缺失文件."""
+def load_config(root: Path, device: str) -> PreTrainedConfig:
+    """只接受支持的本地策略配置，不通过 Hub 自动补齐缺失文件."""
     if not root.is_dir():
         raise FileNotFoundError(f"Local checkpoint directory does not exist: {root}")
-    if read_json(root / "config.json").get("type") != "diffusion":
-        raise NotImplementedError("Export currently supports Diffusion policies only")
-    cfg = DiffusionConfig.from_pretrained(root, local_files_only=True)
+    policy_type = read_json(root / "config.json").get("type")
+    config_cls = {"diffusion": DiffusionConfig, "act": ACTConfig}.get(policy_type)
+    if config_cls is None:
+        raise NotImplementedError(f"Unsupported export policy: {policy_type}")
+    cfg = config_cls.from_pretrained(root, local_files_only=True)
     cfg.device = device
-    cfg.compile_model = False
+    if isinstance(cfg, DiffusionConfig):
+        cfg.compile_model = False
     # 权重来自检查点，禁止初始化时联网下载 torchvision 权重。
     cfg.pretrained_backbone_weights = None
     cfg.validate_features()
     return cfg
 
 
-def load_policy(root: Path, device: str) -> DiffusionPolicy:
+def load_policy(root: Path, device: str) -> DiffusionPolicy | ACTPolicy:
     """严格加载全部网络参数，缺失或多余权重都必须报错."""
-    return (
-        DiffusionPolicy.from_pretrained(
-            root, config=load_config(root, device), local_files_only=True, strict=True
-        )
-        .eval()
-        .float()
-    )
+    cfg = load_config(root, device)
+    policy_cls = ACTPolicy if isinstance(cfg, ACTConfig) else DiffusionPolicy
+    return policy_cls.from_pretrained(root, config=cfg, local_files_only=True, strict=True).eval().float()
 
 
 def processor_assets(root: Path) -> list[str]:
@@ -104,7 +106,7 @@ def processor_assets(root: Path) -> list[str]:
     return sorted(set(files))
 
 
-def load_processors(root: Path, cfg: DiffusionConfig, device: str):
+def load_processors(root: Path, cfg: PreTrainedConfig, device: str):
     """通过现有工厂恢复共享 anchor；统计量始终来自检查点而非数据集."""
     processor_assets(root)
     pre, post = make_pre_post_processors(
