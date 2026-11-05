@@ -40,4 +40,4 @@ exec uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-tra
   --save_freq=2000 \
   --log_freq=200 \
   --env_eval_freq=0 \
-  --wandb.enable=false
+  --trackio.enable=false

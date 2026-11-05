@@ -41,7 +41,7 @@ pre-commit run --all-files                           # 检查与格式化（ruff
 ## 仓库结构（`src/` 之外）
 
 - **`tests/`** — 按模块组织的 Pytest 测试套件。测试夹具位于 `tests/fixtures/`，模拟对象位于 `tests/mocks/`。硬件测试使用 `tests/utils.py` 中的跳过装饰器。通过 `Makefile` 运行的端到端测试将结果写入 `tests/outputs/`。
-- **`.github/workflows/`** — 持续集成工作流：`quality.yml`（pre-commit）、`fast_tests.yml`（基础依赖，每次 PR 运行）、`full_tests.yml`（全部可选依赖、端到端测试和 GPU 测试，审批后运行）、`latest_deps_tests.yml`（每日更新依赖锁定文件）、`security.yml`（TruffleHog）、`release.yml`（推送标签时发布到 PyPI）。
+- **`.github/workflows/`** — 持续集成工作流：`quality.yml`（pre-commit）、`fast_tests.yml`（按 pytest 标记分组，每次 PR 运行）、`full_tests.yml`（全部可选依赖、端到端测试和 GPU 测试，审批后运行）、`latest_deps_tests.yml`（每日更新依赖锁定文件）、`security.yml`（TruffleHog）、`release.yml`（推送标签时发布到 PyPI）。
 - **`docs/source/`** — Hugging Face 文档（`.mdx` 文件），包含各策略的 README、硬件指南和教程。通过 `docs-requirements.txt` 和持续集成工作流单独构建。
 - **`examples/`** — 按使用场景组织的用户教程和脚本（数据集创建、训练、硬件配置）。
 - **`docker/`** — 面向用户的 `Dockerfile.user` 和面向持续集成的 `Dockerfile.internal`。
@@ -51,8 +51,9 @@ pre-commit run --all-files                           # 检查与格式化（ruff
 ## 注意事项
 
 - **中文注释**：生成的代码必须添加中文注释，说明关键逻辑、函数或方法的用途，以及必要的参数含义和边界条件。注释应准确、简洁，避免仅重复代码字面含义；修改代码时同步更新相关注释。
-- **Mypy 采用渐进式类型检查**：仅对 `lerobot.envs`、`lerobot.configs`、`lerobot.optim`、`lerobot.model`、`lerobot.cameras`、`lerobot.motors`、`lerobot.transport` 启用严格检查。修改这些模块时需添加类型注解。
+- **Mypy**：检查范围由 `pyproject.toml` 的 `[tool.mypy]` 指定。修改代码时添加类型注解，通过 `pre-commit run mypy --all-files` 检查。
 - **导入规范**：优先在模块顶部导入；同一模块内的同级文件之间使用相对导入（`from .sibling import X`），跨模块使用绝对导入（`from lerobot.module import X`）。
 - **可选依赖**：许多策略、环境和机器人依赖可选依赖组（例如 `lerobot[aloha]`，详见 `pyproject.toml`）。在模块顶部通过 `TYPE_CHECKING or _foo_available` 条件保护可选导入，并在使用时调用 `require_package(...)` 检查依赖。复用 `utils/import_utils.py` 中的 `_foo_available` 标志，不要调用 `is_package_available`。
 - **视频解码**：数据集可将观测数据存储为视频文件。`LeRobotDataset` 负责提取视频帧，但运行测试需要安装 ffmpeg。
 - **优先使用 `uv run` 执行 Python 命令**，不要直接使用 `python` 或 `pip`。
+- **测试标记**：按依赖选择 base、dataset、hardware 或 viz。策略目录外使用 CUDA 且没有 `@require_cuda` 的测试需标记 `@pytest.mark.gpu`。

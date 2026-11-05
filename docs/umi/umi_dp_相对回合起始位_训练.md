@@ -137,7 +137,7 @@ uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" 
   --save_freq=2000 \
   --log_freq=200 \
   --env_eval_freq=0 \
-  --wandb.enable=false
+  --trackio.enable=false
 ```
 
 单卡时，将 `uv run torchrun ... "$(uv run which lerobot-train)"` 替换成 `uv run lerobot-train`。每卡 batch 不变时，总 batch 会从 256 降至 128；若希望保持近似的数据遍历次数，应相应增加总步数。
@@ -159,7 +159,7 @@ uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" 
 | `eval_steps=1000` | 每 1000 步计算留出回合的 `eval_loss` |
 | `save_freq=2000` | 每 2000 步保存，并保存最终步检查点 |
 | `env_eval_freq=0` | 关闭环境 rollout 评估；留出数据集的 loss 验证仍然启用 |
-| `wandb.enable=false` | 本次不记录 wandb |
+| `trackio.enable=false` | 本次不记录 Trackio |
 
 检查点中的其他设置：ResNet18＋ImageNet 预训练权重、学习率 `1e-4`、cosine 调度、warmup 500 步、无混合精度、未启用 EMA。调整学习率应使用 `--policy.optimizer_lr`；默认训练预设会覆盖单独设置的 `--optimizer.lr`。
 

@@ -45,7 +45,7 @@ uv run torchrun --nproc-per-node=2 $(uv run which lerobot-train) \
   --batch_size=128 \
   --steps=18500 \
   --save_freq=0 \
-  --wandb.disable_artifact=true
+  --trackio.disable_artifact=true
 ```
 
 单卡训练时，把开头换成 `uv run lerobot-train`，其余参数不变。
@@ -76,20 +76,15 @@ steps     = 目标 epoch 数 × 数据集总帧数 / 总 batch
 
 ```
 outputs/train/<job>/
-├── checkpoints/
+└── checkpoints/
 │   ├── 018500/
 │   │   ├── pretrained_model/   # 推理用：模型权重、config、前后处理器（含归一化统计量）
 │   │   └── training_state/     # 续训用：优化器、调度器、随机数状态
 │   └── last -> 018500          # 软链接，指向最新的 checkpoint
-└── wandb/offline-run-*/        # wandb 离线日志
 ```
 
 - 如果 `--output_dir` 已经存在，训练会直接报错。每次训练要换一个新目录；或者加 `--resume=true`，接着上次的进度继续训练。
-- 本仓库已将 wandb 改为默认开启、离线模式。训练结束后用下面的命令上传：
-  ```bash
-  uv run wandb sync outputs/train/<job>/wandb/offline-run-*
-  ```
-  想实时在线查看，加 `--wandb.mode=online`；不想记录，加 `--wandb.enable=false`。
+- 训练日志默认关闭。加 `--trackio.enable=true` 开启本地记录，可用 `uv run trackio show --project lerobot` 查看。
 
 ## 3. 参数说明与调参建议
 
@@ -147,8 +142,8 @@ outputs/train/<job>/
 |---|---|---|
 | `--policy.device` | `cuda` | 训练设备。多卡训练时由 torchrun 自动分配 |
 | `--policy.push_to_hub` | `false` | 不上传到 Hugging Face Hub |
-| `--output_dir` / `--job_name` | — | 输出目录和任务名，`job_name` 同时也是 wandb 的 run 名 |
-| `--wandb.disable_artifact` | `true` | 不把 checkpoint 作为 wandb artifact 保存，避免重复占用磁盘 |
+| `--output_dir` / `--job_name` | — | 输出目录和任务名，`job_name` 用于生成 Trackio 运行名称 |
+| `--trackio.disable_artifact` | `true` | 不把 checkpoint 作为 Trackio artifact 保存，避免重复占用磁盘 |
 
 ## 4. 经验数据（jingbao 数据集，127 个回合，38848 帧）
 
@@ -183,5 +178,4 @@ outputs/train/<job>/
 
 - **`output_dir` 已存在而报错**：换一个新的输出目录，或者加 `--resume=true`，接着上次的进度继续训练。
 - **改了 `--optimizer.lr` 但学习率没变**：要改用 `--policy.optimizer_lr`，见 3.5 节。
-- **找不到 `wandb` 命令**：wandb 装在项目的虚拟环境里，要用 `uv run wandb ...` 运行。
 - **多卡时学习率和步数会不会自动调整**：不会。总 batch 等于每卡 batch 乘以 GPU 数，`--steps` 需要按 2.1 节的公式重新计算。
