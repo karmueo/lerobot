@@ -45,7 +45,7 @@ p_relative(t) = transpose(R_0) × (p_t - p_0)
 
 ```bash
 cd /home/scl/work/lerobot
-uv sync --locked --extra diffusion --extra dataset
+uv sync --locked --extra diffusion --extra training
 ```
 
 需要可用的 CUDA/PyTorch 环境，以及视频解码所需的 FFmpeg、torchcodec。本文双卡命令要求两张可用的 NVIDIA GPU。
@@ -99,11 +99,11 @@ head -n 28 /home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick/meta/
 bash scripts/train_dp_pick_episode_start_tcp.sh
 ```
 
-脚本固定写入 `outputs/train/dp_pick_episode_start_tcp`。**当前该目录已经有训练结果，再次执行会因目录存在而报错。重新训练请使用下一节的新目录命令。**
+脚本固定写入 `outputs/train/dp_pick_episode_start_tcp`，保留了原始训练关闭 Trackio 的设置。**当前该目录已经有训练结果，再次执行会因目录存在而报错。重新训练请使用下一节默认开启 Trackio 的新目录命令。**
 
 ### 3.2 重新训练同类模型
 
-以下命令与原始脚本的训练设置一致，仅将输出目录和任务名改为 `_rerun`，从头训练新模型。若该目录也已存在，请再次更换名称。
+以下命令沿用原始脚本的模型与训练参数，将输出目录和任务名改为 `_rerun`，并默认开启 Trackio 记录曲线，从头训练新模型。若该目录也已存在，请再次更换名称。第 2 节的 `training` 依赖组包含 Trackio 和训练所需依赖。
 
 ```bash
 cd /home/scl/work/lerobot
@@ -137,7 +137,9 @@ uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" 
   --save_freq=2000 \
   --log_freq=200 \
   --env_eval_freq=0 \
-  --trackio.enable=false
+  --trackio.enable=true \
+  --trackio.project=lerobot \
+  --trackio.disable_artifact=true
 ```
 
 单卡时，将 `uv run torchrun ... "$(uv run which lerobot-train)"` 替换成 `uv run lerobot-train`。每卡 batch 不变时，总 batch 会从 256 降至 128；若希望保持近似的数据遍历次数，应相应增加总步数。
@@ -159,7 +161,9 @@ uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" 
 | `eval_steps=1000` | 每 1000 步计算留出回合的 `eval_loss` |
 | `save_freq=2000` | 每 2000 步保存，并保存最终步检查点 |
 | `env_eval_freq=0` | 关闭环境 rollout 评估；留出数据集的 loss 验证仍然启用 |
-| `trackio.enable=false` | 本次不记录 Trackio |
+| `trackio.enable=true` | 上述新训练命令默认记录 Trackio 曲线；原始训练为 `false` |
+| `trackio.project=lerobot` | 将运行记录归入本地 `lerobot` 项目 |
+| `trackio.disable_artifact=true` | 不向 Trackio 上传模型文件，仍记录训练与验证指标 |
 
 检查点中的其他设置：ResNet18＋ImageNet 预训练权重、学习率 `1e-4`、cosine 调度、warmup 500 步、无混合精度、未启用 EMA。调整学习率应使用 `--policy.optimizer_lr`；默认训练预设会覆盖单独设置的 `--optimizer.lr`。
 
@@ -174,6 +178,25 @@ steps ≈ 目标 epoch 数 × 训练集帧数 / 总有效 batch
 ```
 
 本次 `19466 × 256 / 41528 ≈ 120`，约为 120 个 epoch。应使用划分后的训练集帧数估算，并以训练日志的 `epch` 字段核对；尾帧采样规则和 batch 取整会影响实际遍历情况。19466 只是本次配置的总步数，不代表其他数据集也应使用相同步数。
+
+### 3.5 查看训练曲线
+
+训练过程中或结束后，在训练机器上另开终端，进入仓库并启动 Trackio 面板：
+
+```bash
+cd /home/scl/work/lerobot
+uv run trackio show --project lerobot
+```
+
+打开命令输出的网址，在项目中选择 `dp_pick_episode_start_tcp_rerun-<短 ID>` 对应的运行记录。运行名称默认由 `job_name` 加随机短 ID 生成；可在训练命令中用 `--trackio.run_name=<名称>` 显式指定。
+
+- `train/loss`：训练损失，每 `log_freq=200` 步记录一次。
+- `eval/eval_loss`：留出回合的验证损失，每 `eval_steps=1000` 步记录一次，用于观察泛化和过拟合趋势。
+- 横轴选择训练步数（step），可结合平滑曲线观察整体趋势。
+
+未设置 `trackio.space_id` 时，指标默认保存在训练用户的 `~/.cache/huggingface/trackio`，不在 `output_dir` 中；训练结束后仍可查看。若通过 SSH 训练，需将面板实际使用的端口转发到本机，再用本机浏览器访问。
+
+原始训练未开启 Trackio，无法在面板中补回历史曲线；若保留了 `train.log`，可从日志中的损失数值另行绘图。恢复训练时再开启 Trackio，只能记录后续步骤。
 
 ## 4. 检查训练结果与恢复中断训练
 
@@ -239,3 +262,5 @@ T_B_target = T_B_start × T_start_target
 本模型的后处理器**不会自动完成上面的起始坐标系到机器人参考系的转换**。现有 `dp_infer_lerobot` 不能直接复用来控制该模型；需要适配 7 维轴角表示、固定回合起点和 TCP 标定。旧的 10 维相对当前帧检查点也不能与本模型互换。
 
 如需导出 ONNX／TensorRT，可参考 [UMI 模型部署](./模型部署.md) 并替换为本文的检查点路径；导出模型后，机器人侧仍需实现上述坐标转换。
+
+`lerobot-export` 会读取检查点 `train_config.json` 中的 `dataset.root`，将训练数据的 `meta/fastumi.json` 原样复制为导出目录下的 `fastumi.json`，与 `encoder.onnx`、`denoiser.onnx` 同级，并纳入 `manifest.json` 的文件摘要校验。部署时一并保留该文件，以核对 `pose_frame=episode_start_tcp`、TCP 定义、状态／动作布局和单位。若训练配置未记录数据路径或源文件不存在，导出会警告并跳过复制；导出前应确保训练数据路径仍可访问。
