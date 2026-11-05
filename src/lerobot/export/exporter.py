@@ -52,6 +52,21 @@ def tensor_spec(tensor: torch.Tensor) -> dict:
     return {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
 
 
+def _fastumi_metadata(source: Path) -> Path | None:
+    """从检查点记录的本地训练数据路径查找坐标约定；普通数据集可不含此文件."""
+    training_config = source / "train_config.json"
+    if training_config.is_file():
+        dataset_root = read_json(training_config).get("dataset", {}).get("root")
+        if dataset_root:
+            metadata = Path(dataset_root).expanduser() / "meta" / "fastumi.json"
+            if metadata.is_file():
+                return metadata
+            logging.warning("Training dataset metadata not found: %s; skipping fastumi.json", metadata)
+            return None
+    logging.warning("No training dataset.root in %s; skipping fastumi.json", training_config)
+    return None
+
+
 def export_policy(cfg: ExportConfig) -> Path:
     """导出配置驱动的策略包，错误时保留之前的有效产物."""
     if cfg.format not in {"onnx", "tensorrt", "both"}:
@@ -71,6 +86,7 @@ def export_policy(cfg: ExportConfig) -> Path:
         raise ValueError("TensorRT export requires a CUDA device")
     require_package("onnx", extra="export")
     assets = processor_assets(source)
+    metadata = _fastumi_metadata(source)
     # ACT 使用 CPU 追踪以规避旧 ONNX 导出器混合 CPU/CUDA 常量折叠；engine 仍在目标 GPU 构建。
     trace_device = "cpu" if read_json(source / "config.json").get("type") == "act" else cfg.device
     policy = load_policy(source, trace_device)
@@ -117,6 +133,9 @@ def export_policy(cfg: ExportConfig) -> Path:
         package_assets.mkdir()
         for name in assets:
             shutil.copy2(source / name, package_assets / name)
+        if metadata is not None:
+            # 与 ONNX 放在同一级，并纳入后续摘要；不改写训练数据中的坐标约定。
+            shutil.copy2(metadata, root / "fastumi.json")
         if not is_act:
             write_json(package_assets / "scheduler.json", dict(policy.diffusion.noise_scheduler.config))
         manifest = {

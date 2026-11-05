@@ -89,8 +89,26 @@ def test_roundtrip_full_sampler(tmp_path, relative, scheduler):
     """对齐原生采样、包装采样与重新加载的 ORT 包，并验证 seed/anchor/reset."""
     source, output = tmp_path / "checkpoint", tmp_path / "export"
     cfg = checkpoint(source, relative, scheduler)
+    dataset = tmp_path / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    metadata = dataset / "meta" / "fastumi.json"
+    # 起始 TCP 数据集携带坐标约定；同时覆盖普通数据集缺少此文件的导出。
+    if not relative:
+        metadata.write_text(
+            '{"pose_frame": "episode_start_tcp", "tcp_definition": "gripper_grasp_center"}\n',
+            encoding="utf-8",
+        )
+    (source / "train_config.json").write_text(
+        json.dumps({"dataset": {"root": str(dataset)}}), encoding="utf-8"
+    )
     export_policy(ExportConfig(source, output, format="onnx", device="cpu"))
     manifest = load_manifest(output)
+    if not relative:
+        assert (output / "fastumi.json").read_bytes() == metadata.read_bytes()
+        assert "fastumi.json" in manifest["files"]
+    else:
+        assert not (output / "fastumi.json").exists()
+        assert "fastumi.json" not in manifest["files"]
     assert manifest["model_action_dim"] == (10 if relative else 7)
     assert manifest["action_slice"] == [1, 3]
     native = load_policy(source, "cpu")
@@ -113,6 +131,12 @@ def test_roundtrip_full_sampler(tmp_path, relative, scheduler):
             torch.testing.assert_close(actual, runtime.predict(raw, seed=3)[0], atol=0, rtol=0)
     with pytest.raises(FileExistsError):
         export_policy(ExportConfig(source, output, format="onnx", device="cpu"))
+    if not relative:
+        # 元数据损坏也必须触发模型包校验，避免部署时读取错误的坐标约定。
+        (output / "fastumi.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError, match="checksum"):
+            load_manifest(output)
+        (output / "fastumi.json").write_bytes(metadata.read_bytes())
     (output / "encoder.onnx").write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="checksum"):
         load_manifest(output)
