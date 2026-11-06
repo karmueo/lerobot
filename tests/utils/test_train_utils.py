@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -25,10 +27,14 @@ import torch
 
 from lerobot.common import train_utils
 from lerobot.common.train_utils import (
+    commit_best_and_last_checkpoint,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_best_checkpoint_state,
     load_training_metadata,
+    prepare_best_and_last_checkpoint,
     push_checkpoint_to_hub,
+    restore_best_checkpoint_link,
     save_training_metadata,
     save_training_state,
     should_save_checkpoint,
@@ -102,6 +108,105 @@ def test_update_last_checkpoint(tmp_path):
     last_checkpoint = tmp_path / LAST_CHECKPOINT_LINK
     assert last_checkpoint.is_symlink()
     assert last_checkpoint.resolve() == checkpoint
+
+
+def _save_managed_checkpoint(output_dir, step, best_loss, best_step, best_dir, *, best, last):
+    # 用轻量文件区分每次保存，检查点链接仍走真实文件系统操作。
+    checkpoint = get_step_checkpoint_dir(output_dir, 5000, step)
+    pending = prepare_best_and_last_checkpoint(checkpoint)
+    (pending / "model.txt").write_text(str(step))
+    return commit_best_and_last_checkpoint(
+        pending, checkpoint, best_loss, best_step, best_dir, update_best=best, update_last=last
+    )
+
+
+def test_best_and_last_keep_current_snapshots_and_resume_history(tmp_path):
+    first = _save_managed_checkpoint(tmp_path, 1000, 0.8, 1000, None, best=True, last=False)
+    best_link = first.parent / "best"
+    last_link = first.parent / "last"
+    assert best_link.resolve() == first
+    assert not last_link.exists()
+
+    second = _save_managed_checkpoint(tmp_path, 2000, 0.8, 1000, first.name, best=False, last=True)
+    assert best_link.resolve() == first
+    assert last_link.resolve() == second
+    assert load_best_checkpoint_state(tmp_path, second) == (0.8, 1000, first.name)
+
+    third = _save_managed_checkpoint(tmp_path, 3000, 0.7, 3000, first.name, best=True, last=False)
+    assert best_link.resolve() == third
+    assert last_link.resolve() == second
+    assert not first.exists()
+
+    fourth = _save_managed_checkpoint(tmp_path, 4000, 0.6, 4000, third.name, best=True, last=True)
+    assert best_link.resolve() == last_link.resolve() == fourth
+    assert (best_link / "model.txt").read_text() == "4000"
+    assert not second.exists()
+    assert not third.exists()
+    assert load_best_checkpoint_state(tmp_path, fourth) == (0.6, 4000, fourth.name)
+
+
+def test_best_and_last_resume_and_unowned_backups(tmp_path):
+    first = _save_managed_checkpoint(tmp_path, 1000, 0.8, 1000, None, best=True, last=False)
+    second = _save_managed_checkpoint(tmp_path, 2000, 0.8, 1000, first.name, best=False, last=True)
+    best_link = first.parent / "best"
+    best_link.unlink()
+    best_loss, best_step, best_dir = load_best_checkpoint_state(tmp_path, second)
+    assert (best_loss, best_step, best_dir) == (0.8, 1000, first.name)
+    restore_best_checkpoint_link(tmp_path, best_dir)
+    assert best_link.resolve() == first
+
+    # 即使复制了受管状态，名称不匹配的备份仍归用户所有。
+    backup = first.parent / "000999"
+    shutil.copytree(first, backup)
+    named_backup = first.parent / "manual-backup"
+    shutil.copytree(first, named_backup)
+    # 从旧的 best 续训再次保存同一步时，不能覆盖现有 last。
+    replacement = _save_managed_checkpoint(tmp_path, 2000, 0.7, 2000, first.name, best=True, last=False)
+    assert replacement != second
+    assert (first.parent / "last").resolve() == second
+    assert backup.is_dir()
+    assert named_backup.is_dir()
+
+
+def test_best_and_last_recover_interrupted_save(tmp_path, monkeypatch):
+    first = _save_managed_checkpoint(tmp_path, 1000, 0.8, 1000, None, best=True, last=True)
+    checkpoint = get_step_checkpoint_dir(tmp_path, 5000, 2000)
+    worker_pending = prepare_best_and_last_checkpoint(checkpoint, is_main=False)
+    assert not worker_pending.exists()
+    pending = prepare_best_and_last_checkpoint(checkpoint)
+    assert pending == worker_pending
+    (pending / "partial").touch()
+    next_checkpoint = get_step_checkpoint_dir(tmp_path, 5000, 3000)
+    assert prepare_best_and_last_checkpoint(next_checkpoint) == pending
+    assert not (pending / "partial").exists()
+    assert (first.parent / "best").resolve() == first
+    assert (first.parent / "last").resolve() == first
+
+    original_replace = train_utils.os.replace
+
+    def fail_best_link(src, dst):
+        if Path(dst) == first.parent / "best":
+            raise OSError("模拟链接切换失败")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(train_utils.os, "replace", fail_best_link)
+    with pytest.raises(OSError, match="模拟链接切换失败"):
+        commit_best_and_last_checkpoint(
+            pending, next_checkpoint, 0.7, 3000, first.name, update_best=True, update_last=True
+        )
+    assert (first.parent / "best").resolve() == first
+    assert (first.parent / "last").resolve() == first
+    monkeypatch.setattr(train_utils.os, "replace", original_replace)
+    latest = _save_managed_checkpoint(tmp_path, 4000, 0.6, 4000, first.name, best=True, last=True)
+    assert not next_checkpoint.exists()
+    assert (first.parent / "best").resolve() == latest
+    assert (first.parent / "last").resolve() == latest
+
+
+def test_best_and_last_no_evaluation_yet(tmp_path):
+    checkpoint = _save_managed_checkpoint(tmp_path, 1000, math.inf, None, None, best=False, last=True)
+    assert load_best_checkpoint_state(tmp_path, checkpoint) == (math.inf, None, None)
+    assert (checkpoint.parent / "last").resolve() == checkpoint
 
 
 # save_checkpoint round-trips (all formats, real policies) live in
@@ -185,6 +290,91 @@ def test_resolve_resume_checkpoint_raises_without_checkpoints(tmp_path, monkeypa
     monkeypatch.setattr("lerobot.common.train_utils.find_latest_hub_checkpoint", lambda repo_id: None)
     with pytest.raises(FileNotFoundError, match="No checkpoint"):
         train_utils.resolve_resume_checkpoint("u/run", tmp_path / "run")
+
+
+@pytest.mark.parametrize("best_name", ["001000", "001000-1", "002000", None])
+def test_hub_resume_restores_best_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, best_name: str | None
+) -> None:
+    """模拟 Hub 只按请求下载目录，覆盖 best 与 last 不同步及尚未验证的情况。"""
+    remote, local = tmp_path / "remote", tmp_path / "local"
+    latest = remote / CHECKPOINTS_DIR / "002000"
+    best = remote / CHECKPOINTS_DIR / best_name if best_name is not None else None
+    # 先保存 best，再保存 last，模拟真实训练中的引用和清理顺序。
+    checkpoints = [best, latest] if best is not None and best != latest else [latest]
+    for checkpoint in checkpoints:
+        pending = prepare_best_and_last_checkpoint(checkpoint)
+        train_utils.write_json({"eval_seed": 1000}, pending / train_utils.EVAL_PROTOCOL)
+        commit_best_and_last_checkpoint(
+            pending,
+            checkpoint,
+            0.5 if best else math.inf,
+            1000 if best else None,
+            best_name,
+            update_best=checkpoint == best,
+            update_last=checkpoint == latest,
+        )
+    downloads: list[str] = []
+
+    def download(repo_id: str, repo_type: str, allow_patterns: str, local_dir: str) -> str:
+        downloads.append(allow_patterns)
+        relative = allow_patterns.removesuffix("/*")
+        shutil.copytree(remote / relative, Path(local_dir) / relative)
+        return local_dir
+
+    monkeypatch.setattr(train_utils, "find_latest_hub_checkpoint", lambda _: "checkpoints/002000")
+    monkeypatch.setattr(train_utils, "snapshot_download", download)
+    resumed = train_utils.resolve_resume_checkpoint("user/run", local)
+    assert resumed == local / CHECKPOINTS_DIR / "002000"
+    assert (local / CHECKPOINTS_DIR / "last").resolve() == resumed
+    expected = ["checkpoints/002000/*"]
+    if best_name is not None:
+        assert (local / CHECKPOINTS_DIR / "best").resolve() == local / CHECKPOINTS_DIR / best_name
+        assert load_best_checkpoint_state(local, resumed) == (0.5, 1000, best_name)
+        if best_name != "002000":
+            expected.append(f"checkpoints/{best_name}/*")
+    else:
+        assert not (local / CHECKPOINTS_DIR / "best").exists()
+        assert load_best_checkpoint_state(local, resumed) == (math.inf, None, None)
+    assert downloads == expected
+
+
+@pytest.mark.parametrize("failure", ["missing", "protocol", "invalid_name"])
+def test_hub_resume_rejects_invalid_best_before_linking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """缺失、协议不一致或非法路径的历史 best 不得发布为可续训链接。"""
+    downloads: list[str] = []
+
+    def download(repo_id: str, repo_type: str, allow_patterns: str, local_dir: str) -> str:
+        downloads.append(allow_patterns)
+        checkpoint = Path(local_dir) / allow_patterns.removesuffix("/*")
+        if checkpoint.name == "002000":
+            train_utils.write_json(
+                {
+                    "best_eval_loss": 0.5,
+                    "best_step": 1000,
+                    "best_dir": "../outside" if failure == "invalid_name" else "001000",
+                },
+                checkpoint / TRAINING_STATE_DIR / "best_checkpoint.json",
+            )
+            train_utils.write_json({"eval_seed": 1000}, checkpoint / train_utils.EVAL_PROTOCOL)
+        elif failure == "protocol":
+            train_utils.write_json({"eval_seed": 2000}, checkpoint / train_utils.EVAL_PROTOCOL)
+        return local_dir
+
+    monkeypatch.setattr(train_utils, "find_latest_hub_checkpoint", lambda _: "checkpoints/002000")
+    monkeypatch.setattr(train_utils, "snapshot_download", download)
+    message = {
+        "missing": "no evaluation protocol",
+        "protocol": "Evaluation protocol mismatch",
+        "invalid_name": "Invalid best checkpoint state",
+    }[failure]
+    with pytest.raises(ValueError, match=message):
+        train_utils.resolve_resume_checkpoint("user/run", tmp_path)
+    for name in ("best", "last"):
+        assert not (tmp_path / CHECKPOINTS_DIR / name).is_symlink()
+    assert len(downloads) == (1 if failure == "invalid_name" else 2)
 
 
 @pytest.mark.dataset

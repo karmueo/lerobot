@@ -24,7 +24,10 @@ its writes live in the same method.
 """
 
 import logging
+import math
 import os
+import re
+import shutil
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -73,6 +76,7 @@ from lerobot.optim.ema import EMA, load_ema_state, save_ema_state
 from lerobot.policies import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
+    BEST_CHECKPOINT_LINK,
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
     PRETRAINED_MODEL_DIR,
@@ -81,8 +85,10 @@ from lerobot.utils.constants import (
     TRAINING_STEP,
 )
 from lerobot.utils.hub import find_latest_hub_checkpoint
-from lerobot.utils.io_utils import load_json, write_json
+from lerobot.utils.io_utils import JsonLike, load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+
+from .eval_protocol import EVAL_PROTOCOL, validate_eval_protocol
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -146,6 +152,147 @@ def update_last_checkpoint(checkpoint_dir: Path) -> None:
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
     last_checkpoint_dir.symlink_to(relative_target)
+
+
+_BEST_CHECKPOINT_STATE = "best_checkpoint.json"
+_PENDING_CHECKPOINT_MARKER = ".lerobot_pending_checkpoint"
+_PENDING_CHECKPOINT_DIR = ".best-last.pending"
+
+
+def _replace_checkpoint_link(checkpoint_dir: Path, name: str) -> None:
+    """原子切换相对链接，确保切换失败时旧链接仍可用。"""
+    link = checkpoint_dir.parent / name
+    temporary_link = checkpoint_dir.parent / f".{name}.tmp"
+    if link.exists() and not link.is_symlink():
+        raise FileExistsError(f"Checkpoint link is not a symlink: {link}")
+    if temporary_link.is_symlink():
+        temporary_link.unlink()
+    elif temporary_link.exists():
+        raise FileExistsError(f"Temporary checkpoint link already exists: {temporary_link}")
+    temporary_link.symlink_to(checkpoint_dir.name, target_is_directory=True)
+    os.replace(temporary_link, link)
+
+
+def prepare_best_and_last_checkpoint(checkpoint_dir: Path, *, is_main: bool = True) -> Path:
+    """返回共同写入的暂存目录，由主进程清理并创建目录。"""
+    pending = checkpoint_dir.parent / _PENDING_CHECKPOINT_DIR
+    if not is_main:
+        return pending
+    checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+    if pending.exists() or pending.is_symlink():
+        if pending.is_symlink() or not (pending / _PENDING_CHECKPOINT_MARKER).is_file():
+            raise FileExistsError(f"Unrecognized checkpoint staging path: {pending}")
+        shutil.rmtree(pending)
+    pending.mkdir()
+    (pending / _PENDING_CHECKPOINT_MARKER).touch()
+    return pending
+
+
+def load_best_checkpoint_state(
+    output_dir: Path, checkpoint_dir: Path
+) -> tuple[float, int | None, str | None]:
+    """读取续训时的历史最佳值，优先使用已提交的 best 链接。"""
+    checkpoints_dir = output_dir / CHECKPOINTS_DIR
+    best_link = checkpoints_dir / BEST_CHECKPOINT_LINK
+    if best_link.exists() and not best_link.is_symlink():
+        raise FileExistsError(f"Checkpoint link is not a symlink: {best_link}")
+    if best_link.is_symlink() and not best_link.is_dir():
+        raise FileNotFoundError(f"Best checkpoint link is broken: {best_link}")
+    state_dir = best_link if best_link.is_symlink() else checkpoint_dir
+    state_file = state_dir / TRAINING_STATE_DIR / _BEST_CHECKPOINT_STATE
+    if not state_file.is_file():
+        if best_link.is_symlink():
+            raise FileNotFoundError(f"Best checkpoint state is missing: {state_file}")
+        return math.inf, None, None
+    state = load_json(state_file)
+    loss = state.get("best_eval_loss")
+    step = state.get("best_step")
+    best_dir = state.get("best_dir")
+    if loss is None and step is None and best_dir is None:
+        return math.inf, None, None
+    if (
+        not isinstance(loss, (int, float))
+        or not math.isfinite(loss)
+        or not isinstance(step, int)
+        or not isinstance(best_dir, str)
+        or not re.fullmatch(r"\d{6,}(?:-[1-9]\d*)?", best_dir)
+    ):
+        raise ValueError(f"Invalid best checkpoint state: {state_file}")
+    target = checkpoints_dir / best_dir
+    if not target.is_dir() or target.is_symlink():
+        raise FileNotFoundError(f"Recorded best checkpoint is missing: {target}")
+    if best_link.is_symlink() and best_link.resolve() != target.resolve():
+        raise ValueError(f"Best checkpoint state does not match link: {best_link}")
+    return float(loss), step, best_dir
+
+
+def restore_best_checkpoint_link(output_dir: Path, best_dir: str | None) -> None:
+    """续训时恢复缺失的 best 链接，供后续保存与清理使用。"""
+    if best_dir is None:
+        return
+    checkpoints_dir = output_dir / CHECKPOINTS_DIR
+    best_link = checkpoints_dir / BEST_CHECKPOINT_LINK
+    if not best_link.is_symlink():
+        _replace_checkpoint_link(checkpoints_dir / best_dir, BEST_CHECKPOINT_LINK)
+
+
+def commit_best_and_last_checkpoint(
+    pending: Path,
+    checkpoint_dir: Path,
+    best_loss: float,
+    best_step: int | None,
+    best_dir: str | None,
+    *,
+    update_best: bool,
+    update_last: bool,
+) -> Path:
+    """提交完整检查点，再切换链接并删除失去引用的受管检查点。"""
+    # 从较早的 best 续训可能再次到达已有步数，保留旧目录直到新链接提交。
+    final_dir = checkpoint_dir
+    version = 1
+    while final_dir.exists() or final_dir.is_symlink():
+        final_dir = checkpoint_dir.with_name(f"{checkpoint_dir.name}-{version}")
+        version += 1
+
+    if update_best:
+        best_dir = final_dir.name
+    state: dict[str, JsonLike] = {
+        "best_eval_loss": best_loss if math.isfinite(best_loss) else None,
+        "best_step": best_step,
+        "best_dir": best_dir,
+        "checkpoint_dir": final_dir.name,
+    }
+    write_json(state, pending / TRAINING_STATE_DIR / _BEST_CHECKPOINT_STATE)
+    os.replace(pending, final_dir)
+
+    if update_best:
+        _replace_checkpoint_link(final_dir, BEST_CHECKPOINT_LINK)
+    if update_last:
+        _replace_checkpoint_link(final_dir, LAST_CHECKPOINT_LINK)
+
+    # 只清理含本功能状态文件的目录，保留旧训练或用户自行保存的检查点。
+    referenced = {
+        link.resolve()
+        for name in (BEST_CHECKPOINT_LINK, LAST_CHECKPOINT_LINK)
+        if (link := checkpoint_dir.parent / name).is_symlink()
+    }
+    for candidate in checkpoint_dir.parent.iterdir():
+        state_file = candidate / TRAINING_STATE_DIR / _BEST_CHECKPOINT_STATE
+        if (
+            candidate.is_dir()
+            and not candidate.is_symlink()
+            and re.fullmatch(r"\d{6,}(?:-[1-9]\d*)?", candidate.name)
+            and candidate.resolve() not in referenced
+            and state_file.is_file()
+        ):
+            # 状态中的名称绑定所有权，复制出的备份及损坏文件不会被删除。
+            try:
+                candidate_state = load_json(state_file)
+            except (OSError, ValueError):
+                continue
+            if isinstance(candidate_state, dict) and candidate_state.get("checkpoint_dir") == candidate.name:
+                shutil.rmtree(candidate)
+    return final_dir
 
 
 # ---------------------------------------------------------------------------------------------
@@ -661,7 +808,8 @@ def resolve_resume_checkpoint(repo_id: str, output_dir: Path) -> Path:
     The symmetric counterpart to `push_checkpoint_to_hub`: given a model repo holding
     `checkpoints/<step>/{pretrained_model,training_state}` subtrees, download the highest-numbered step
     into `output_dir/checkpoints/<step>/`, recreate the local `last` symlink, and return that local
-    checkpoint dir. Used to resume training from the Hub on a machine (or HF Jobs pod) that does not
+    checkpoint dir. Also downloads the recorded best checkpoint when it is a different step.
+    Used to resume training from the Hub on a machine (or HF Jobs pod) that does not
     have the original local run dir.
 
     Args:
@@ -687,6 +835,30 @@ def resolve_resume_checkpoint(repo_id: str, output_dir: Path) -> Path:
         local_dir=str(output_dir),
     )
     checkpoint_dir = output_dir / latest
+    state_file = checkpoint_dir / TRAINING_STATE_DIR / _BEST_CHECKPOINT_STATE
+    if state_file.is_file():
+        state = load_json(state_file)
+        if not isinstance(state, dict):
+            raise ValueError(f"Invalid best checkpoint state: {state_file}")
+        best_dir = state.get("best_dir")
+        if best_dir is not None:
+            # 远端状态参与路径构造，必须先验证名称，再下载历史最佳检查点。
+            if not isinstance(best_dir, str) or not re.fullmatch(r"\d{6,}(?:-[1-9]\d*)?", best_dir):
+                raise ValueError(f"Invalid best checkpoint state: {state_file}")
+            best_path = output_dir / CHECKPOINTS_DIR / best_dir
+            if best_path != checkpoint_dir:
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    allow_patterns=f"{CHECKPOINTS_DIR}/{best_dir}/*",
+                    local_dir=str(output_dir),
+                )
+            # 先检查损失状态和两份验证协议，再发布链接；训练入口还会与当前配置核对。
+            protocol_path = checkpoint_dir / EVAL_PROTOCOL
+            if protocol_path.is_file():
+                validate_eval_protocol(best_path, load_json(protocol_path), allow_legacy=False)
+        _, _, best_dir = load_best_checkpoint_state(output_dir, checkpoint_dir)
+        restore_best_checkpoint_link(output_dir, best_dir)
     update_last_checkpoint(checkpoint_dir)
     return checkpoint_dir
 
