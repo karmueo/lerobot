@@ -16,6 +16,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.streaming.episode_pool import StreamingSamplingStrategy
 from lerobot.transforms import ImageTransformsConfig
@@ -78,6 +79,9 @@ class DatasetConfig:
     video_decoder_cache_size: int | None = None
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # 默认保持按任务尾部划分；随机划分使用独立种子，不影响训练随机流。
+    eval_split_strategy: Literal["tail", "random"] = "tail"
+    eval_split_seed: int = 1000
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
@@ -92,6 +96,10 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if self.eval_split_strategy not in ("tail", "random"):
+            raise ValueError(
+                f"eval_split_strategy must be 'tail' or 'random', got {self.eval_split_strategy!r}"
+            )
         self.streaming_sampling_strategy = StreamingSamplingStrategy(self.streaming_sampling_strategy)
         if self.streaming_episode_pool_size is not None and self.streaming_episode_pool_size <= 0:
             raise ValueError("streaming_episode_pool_size must be positive")

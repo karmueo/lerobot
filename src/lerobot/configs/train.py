@@ -163,6 +163,10 @@ class TrainPipelineConfig(HubMixin):
     log_freq: int = 200  # 0 or negative disables periodic logging
     # Compute eval loss on held-out episodes every N steps (0 = disabled). Requires eval_split > 0.
     eval_steps: int = 0
+    # 固定验证噪声，同时隔离验证前后的训练随机状态；None 保持原有随机行为。
+    eval_seed: int | None = None
+    # 使用 EMA 参数计算用于选择最佳检查点的验证损失。
+    eval_use_ema: bool = False
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
     tolerance_s: float = 1e-4
@@ -170,6 +174,8 @@ class TrainPipelineConfig(HubMixin):
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
     save_freq: int = 20_000
+    # 按验证损失保留最佳检查点，并仅保留最新的定期检查点。
+    keep_best_and_last: bool = False
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
@@ -359,6 +365,16 @@ class TrainPipelineConfig(HubMixin):
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+
+        if self.eval_seed is not None and not 0 <= self.eval_seed < 2**32:
+            raise ValueError("eval_seed must be between 0 and 2**32 - 1.")
+        if self.eval_use_ema and self.ema is None:
+            raise ValueError(
+                "eval_use_ema=true requires an EMA configuration, for example --ema.type=warmup."
+            )
+
+        if self.keep_best_and_last and (not self.save_checkpoint or self.eval_steps <= 0):
+            raise ValueError("keep_best_and_last requires save_checkpoint=true and eval_steps > 0.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

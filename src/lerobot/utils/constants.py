@@ -65,6 +65,7 @@ TELEOPERATORS = "teleoperators"
 
 # files & directories
 CHECKPOINTS_DIR = "checkpoints"
+BEST_CHECKPOINT_LINK = "best"
 LAST_CHECKPOINT_LINK = "last"
 PRETRAINED_MODEL_DIR = "pretrained_model"
 PRETRAINED_MODEL_EMA_DIR = "pretrained_model_ema"

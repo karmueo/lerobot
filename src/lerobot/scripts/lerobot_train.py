@@ -30,9 +30,10 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+import math
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -46,13 +47,23 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from tqdm import tqdm
 
+from lerobot.common.eval_protocol import (
+    EVAL_PROTOCOL,
+    SPLIT_MANIFEST,
+    build_eval_protocol,
+    validate_eval_protocol,
+)
 from lerobot.common.trackio_utils import TrackioLogger
 from lerobot.common.train_utils import (
+    commit_best_and_last_checkpoint,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_best_checkpoint_state,
     load_training_metadata,
+    prepare_best_and_last_checkpoint,
     publish_trained_model,
     push_checkpoint_to_hub,
+    restore_best_checkpoint_link,
     resume_after_prepare,
     resume_before_prepare,
     save_checkpoint,
@@ -69,7 +80,7 @@ from lerobot.datasets import (
     compute_sampler_state,
 )
 from lerobot.datasets.compute_stats import compute_relative_pose_stats
-from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.factory import build_split_manifest, make_train_eval_datasets
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.distributed import (
     ParallelDims,
@@ -88,15 +99,24 @@ from lerobot.processor import ImageAugmentationProcessorStep
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION, OBS_STATE, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import (
+    ACTION,
+    BEST_CHECKPOINT_LINK,
+    CHECKPOINTS_DIR,
+    OBS_STATE,
+    PRETRAINED_MODEL_DIR,
+    PRETRAINED_MODEL_EMA_DIR,
+    TRAINING_STATE_DIR,
+)
 from lerobot.utils.import_utils import (
     _accelerate_available,
     _peft_available,
     register_third_party_plugins,
     require_package,
 )
+from lerobot.utils.io_utils import write_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.utils.random_utils import set_seed
+from lerobot.utils.random_utils import seeded_context, set_seed
 from lerobot.utils.sample_weighting import SampleWeighter
 from lerobot.utils.utils import (
     cycle,
@@ -321,6 +341,46 @@ def update_policy(
     if output_dict:
         train_metrics.update_metrics(output_dict)
     return train_metrics, output_dict
+
+
+def compute_offline_eval_loss(
+    policy: torch.nn.Module,
+    eval_dataloader: Any,
+    preprocess_batch: Callable[[Any], Any],
+    accelerator: "Accelerator",
+    *,
+    seed: int | None,
+    ema: EMA | None = None,
+) -> tuple[float, int]:
+    """以指定权重计算验证损失，保证固定噪声不改变训练随机流。
+
+    返回各进程的批次均值及总批次数；保留现有分布式归约口径。
+    """
+    # 某些策略会单独冻结子模块的训练模式，不能用统一 train() 覆盖它们。
+    module_modes = [(module, module.training) for module in policy.modules()]
+    rng_context = seeded_context(seed) if seed is not None else nullcontext()
+    weights_context = (
+        ema.average_parameters(accelerator.unwrap_model(policy)) if ema is not None else nullcontext()
+    )
+    try:
+        policy.eval()
+        eval_loss_sum = 0.0
+        n_eval_batches = 0
+        with rng_context, weights_context, torch.no_grad(), accelerator.autocast():
+            for eval_batch in eval_dataloader:
+                loss, _ = policy(preprocess_batch(eval_batch))
+                eval_loss_sum += loss.item()
+                n_eval_batches += 1
+        loss_tensor = torch.tensor(eval_loss_sum / max(n_eval_batches, 1), device=accelerator.device)
+        loss_value = accelerator.reduce(loss_tensor, reduction="mean").item()
+        count_tensor = torch.tensor(n_eval_batches, device=accelerator.device)
+        total_batches = int(accelerator.reduce(count_tensor, reduction="sum").item())
+        return float(loss_value), total_batches
+    finally:
+        # 根模块先恢复，再修正与根模块状态不同的子模块。
+        for module, was_training in module_modes:
+            if module.training != was_training:
+                module.train(was_training)
 
 
 def make_dataloaders(
@@ -621,6 +681,30 @@ def train(cfg: TrainPipelineConfig) -> None:
     if not is_main_process():
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    split_manifest = None
+    eval_protocol = None
+    if eval_dataset is not None:
+        if cfg.output_dir is None:
+            raise ValueError("`output_dir` must be resolved before training starts.")
+        split_manifest = build_split_manifest(cfg, dataset, eval_dataset)
+        eval_protocol = build_eval_protocol(cfg, split_manifest, parallel_dims.dp_world_size)
+        if cfg.resume:
+            if cfg.checkpoint_path is None:
+                raise ValueError("Resuming requires a checkpoint path.")
+            # 历史检查点未记录协议，只有原始的尾部分割和 live 随机验证可延续其 best。
+            allow_legacy = (
+                cfg.dataset.eval_split_strategy == "tail" and cfg.eval_seed is None and not cfg.eval_use_ema
+            )
+            validate_eval_protocol(cfg.checkpoint_path, eval_protocol, allow_legacy=allow_legacy)
+            best_path = cfg.output_dir / CHECKPOINTS_DIR / BEST_CHECKPOINT_LINK
+            if cfg.keep_best_and_last and best_path.is_symlink():
+                validate_eval_protocol(best_path, eval_protocol, allow_legacy=allow_legacy)
+        if is_main_process():
+            # 训练输出记录实际索引；数据集目录与其元数据保持只读。
+            write_json(split_manifest, cfg.output_dir / SPLIT_MANIFEST)
+            write_json(eval_protocol, cfg.output_dir / EVAL_PROTOCOL)
+        accelerator.wait_for_everyone()
+
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format
     # IS the recorded value: DCP-bearing formats skip the safetensors load here and stream the
@@ -790,6 +874,17 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler, ema)
 
+    best_loss = math.inf
+    best_step: int | None = None
+    best_dir: str | None = None
+    if cfg.keep_best_and_last and cfg.resume:
+        if cfg.checkpoint_path is None:
+            raise ValueError("Resuming requires a checkpoint path.")
+        best_loss, best_step, best_dir = load_best_checkpoint_state(cfg.output_dir, cfg.checkpoint_path)
+        if is_main_process():
+            restore_best_checkpoint_link(cfg.output_dir, best_dir)
+        accelerator.wait_for_everyone()
+
     # --- auxiliaries (after the core assembly, per the construction-order contract) -------------
     sample_weighter = None
     if cfg.sample_weighting is not None:
@@ -917,6 +1012,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and step % cfg.eval_steps == 0
+        is_best_step = False
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
@@ -941,35 +1037,54 @@ def train(cfg: TrainPipelineConfig) -> None:
             train_tracker.reset_averages()
 
         if is_eval_step and eval_dataloader is not None:
-            policy.eval()
-            eval_loss_sum = 0.0
-            n_eval_batches = 0
-            with torch.no_grad(), accelerator.autocast():
-                for eval_batch in eval_dataloader:
-                    eval_batch = _preprocess_dataset_batch(
-                        eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
-                    )
-                    loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
-                    eval_loss_sum += loss.item()
-                    n_eval_batches += 1
-            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
-            eval_loss = torch.tensor(eval_loss, device=device)
-            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
-            policy.train()
+            eval_seed = (cfg.eval_seed + parallel_dims.dp_rank) % 2**32 if cfg.eval_seed is not None else None
+
+            def preprocess_eval_batch(batch: Any) -> Any:
+                return _preprocess_dataset_batch(
+                    batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
+                )
+
+            live_eval_loss, eval_batches = compute_offline_eval_loss(
+                policy, eval_dataloader, preprocess_eval_batch, accelerator, seed=eval_seed
+            )
+            eval_loss = live_eval_loss
+            ema_eval_loss = None
+            if cfg.eval_use_ema:
+                if ema is None:
+                    raise ValueError("eval_use_ema=true requires an EMA configuration.")
+                # 固定种子时两套权重使用同一噪声序列；权重交换在保存前结束。
+                ema_eval_loss, eval_batches = compute_offline_eval_loss(
+                    policy, eval_dataloader, preprocess_eval_batch, accelerator, seed=eval_seed, ema=ema
+                )
+                eval_loss = ema_eval_loss
+
+            if cfg.keep_best_and_last:
+                # 所有进程根据同一个归约结果决定保存，空验证集不能产生最佳模型。
+                is_best_step = eval_batches > 0 and math.isfinite(eval_loss) and eval_loss < best_loss
+                if is_best_step:
+                    best_loss, best_step = eval_loss, step
 
             if is_main_process():
-                logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                logging.info(f"step {step}: eval_loss={eval_loss:.4f} live_eval_loss={live_eval_loss:.4f}")
                 if trackio_logger:
-                    trackio_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    offline_eval_metrics = {"eval_loss": eval_loss, "live_eval_loss": live_eval_loss}
+                    if ema_eval_loss is not None:
+                        offline_eval_metrics["ema_eval_loss"] = ema_eval_loss
+                    trackio_logger.log_dict(offline_eval_metrics, step=step, mode="eval")
 
-        if cfg.save_checkpoint and is_saving_step:
+        if cfg.save_checkpoint and (is_saving_step or is_best_step):
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
             # writes are gated inside save_checkpoint — no rank branches at the call site.
             if is_main_process():
                 logging.info(f"Checkpoint policy after step {step}")
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            write_dir = checkpoint_dir
+            if cfg.keep_best_and_last:
+                # 暂存目录名在所有进程上相同，主进程准备后再共同写入。
+                write_dir = prepare_best_and_last_checkpoint(checkpoint_dir, is_main=is_main_process())
+                accelerator.wait_for_everyone()
             save_checkpoint(
-                checkpoint_dir=checkpoint_dir,
+                checkpoint_dir=write_dir,
                 step=step,
                 cfg=cfg,
                 policy=policy,
@@ -981,7 +1096,28 @@ def train(cfg: TrainPipelineConfig) -> None:
                 ema=ema,
             )
             if is_main_process():
-                update_last_checkpoint(checkpoint_dir)
+                if split_manifest is not None and eval_protocol is not None:
+                    # 模型子目录可独立复制；在提交 best/last 前写入完整评价口径。
+                    artifact_dirs = [write_dir, write_dir / PRETRAINED_MODEL_DIR]
+                    if ema is not None:
+                        artifact_dirs.append(write_dir / PRETRAINED_MODEL_EMA_DIR)
+                    for artifact_dir in artifact_dirs:
+                        write_json(split_manifest, artifact_dir / SPLIT_MANIFEST)
+                        write_json(eval_protocol, artifact_dir / EVAL_PROTOCOL)
+                if cfg.keep_best_and_last:
+                    checkpoint_dir = commit_best_and_last_checkpoint(
+                        write_dir,
+                        checkpoint_dir,
+                        best_loss,
+                        best_step,
+                        best_dir,
+                        update_best=is_best_step,
+                        update_last=is_saving_step,
+                    )
+                    if is_best_step:
+                        best_dir = checkpoint_dir.name
+                else:
+                    update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
                     if cfg.policy is None or not cfg.policy.repo_id:
                         # Already rejected by cfg.validate().

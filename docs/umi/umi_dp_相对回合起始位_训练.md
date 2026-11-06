@@ -1,6 +1,6 @@
 # UMI DP：相对回合起始 TCP 位姿训练
 
-本文说明如何训练 `outputs/train/dp_pick_episode_start_tcp` 这类 Diffusion Policy（DP）模型。参数依据仓库中的 [训练脚本](../../scripts/train_dp_pick_episode_start_tcp.sh) 和该次训练最终检查点的 `train_config.json`。
+本文说明如何使用仓库中的 [训练脚本](../../scripts/train_dp_handumi_tcp.sh) 训练相对回合起始 TCP 的 Diffusion Policy（DP）模型。
 
 核心约定：**数据导出时，已将每个回合的 TCP 位姿转换到该回合首帧 TCP 坐标系；训练时设置 `--policy.use_relative_pose=false`，保持状态和动作均为 7 维。**
 
@@ -41,37 +41,34 @@ p_relative(t) = transpose(R_0) × (p_t - p_0)
 
 ## 2. 数据与环境准备
 
-在仓库根目录执行：
+在仓库根目录安装训练依赖：
 
 ```bash
 cd /home/scl/work/lerobot
 uv sync --locked --extra diffusion --extra training
 ```
 
-需要可用的 CUDA/PyTorch 环境，以及视频解码所需的 FFmpeg、torchcodec。本文双卡命令要求两张可用的 NVIDIA GPU。
+需要可用的 CUDA/PyTorch 环境，以及视频解码所需的 FFmpeg、torchcodec；训练脚本默认使用两张 NVIDIA GPU。
 
-本次训练使用已经转换好的本地数据：
+本文主要使用已有的 `data/handumi_data/umi-demo-tcp-dp-240_134`。脚本也支持 `data/handumi_data/umi-demo-tcp-dp`，但本次对该版本只做了短程兼容验证，没有完成同等规模的训练对照。
 
-| 项目 | 本次取值 |
-|---|---|
-| 数据集路径 | `/home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick` |
-| `repo_id` | `fastumi/pick` |
-| 格式 | LeRobot v3 |
-| 数据规模 | 302 个回合、44212 帧，30 fps |
-| `observation.state` | 7 维，`xyz_rotvec_gripper` |
-| `action` | 7 维，`xyz_rotvec_gripper`，来源为示范轨迹 |
-| 图像 | `observation.images.front`，224×224 RGB |
-| TCP 定义 | `gripper_grasp_center` |
-| 夹爪 | 本数据集为 binary 模式，使用 0～1 表示 |
+| 项目 | `umi-demo-tcp-dp-240_134` | `umi-demo-tcp-dp` |
+|---|---|---|
+| 图像 `observation.images.front` | 宽 240 × 高 134 像素，RGB | 宽 224 × 高 224 像素，RGB |
+| 回合、帧数及帧率 | 200 个回合、53597 帧，30 fps | 200 个回合、53597 帧，30 fps |
+| state / action | 均为 7 维 `xyz_rotvec_gripper` | 均为 7 维 `xyz_rotvec_gripper` |
+| TCP 和夹爪 | 抓取中心，夹爪归一化到 0～1 | 相同 |
 
-训练前检查以下两个文件：
+两者使用相同的轨迹数据，图像尺寸及预处理方式不同。脚本根据目录名生成 `repo_id`，例如 `handumi/umi-demo-tcp-dp-240_134`，并使用数据集图像的原始分辨率。
+
+训练前检查数据集元信息：
 
 ```bash
-cat /home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick/meta/info.json
-head -n 28 /home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick/meta/fastumi.json
+cat data/handumi_data/umi-demo-tcp-dp-240_134/meta/info.json
+cat data/handumi_data/umi-demo-tcp-dp-240_134/meta/fastumi.json
 ```
 
-`info.json` 描述维度、帧数和图像；`fastumi.json` 记录本数据集的坐标系和导出约定，关键字段应为：
+`info.json` 描述维度、帧数和图像；`fastumi.json` 记录坐标系和导出约定，关键字段应为：
 
 ```json
 {
@@ -85,163 +82,156 @@ head -n 28 /home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick/meta/
 }
 ```
 
-换用其他数据集时，应在导出阶段按第 1 节公式转换 state 和 action，并重新生成统计量。仅修改 `pose_frame` 元数据不会转换数据。当前训练命令本身不会执行这一步坐标变换。
+换用其他数据集时，应在导出阶段按第 1 节公式转换 state 和 action，并重新生成统计量。仅修改 `pose_frame` 元数据不会转换数据；训练脚本本身不会执行坐标转换。
 
-本次保留全部 302 个回合（包括 episode 57），未设置 `episodes` 或 `exclude_episodes`。`eval_split=0.1` 按任务留出最后 `ceil(302×0.1)=31` 个回合验证，剩余 271 个回合训练；训练日志记录训练集为 41528 帧。
+默认配置按任务随机划分回合，划分种子为 `1000`，`eval_split=0.1`。该单任务数据集分为 **180 个训练回合和 20 个验证回合**；实际回合编号保存在输出的 `split_manifest.json` 中。原始数据集和现有归一化统计量保持不变；归一化统计量来自整份数据，不是仅由训练集重新计算的统计量。
 
-## 3. 启动训练
+## 3. 启动训练与查看曲线
 
-### 3.1 仓库已有脚本
+### 3.1 选择训练配方
 
-原始训练的启动入口为：
-
-```bash
-bash scripts/train_dp_pick_episode_start_tcp.sh
-```
-
-脚本固定写入 `outputs/train/dp_pick_episode_start_tcp`，保留了原始训练关闭 Trackio 的设置。**当前该目录已经有训练结果，再次执行会因目录存在而报错。重新训练请使用下一节默认开启 Trackio 的新目录命令。**
-
-### 3.2 重新训练同类模型
-
-以下命令沿用原始脚本的模型与训练参数，将输出目录和任务名改为 `_rerun`，并默认开启 Trackio 记录曲线，从头训练新模型。若该目录也已存在，请再次更换名称。第 2 节的 `training` 依赖组包含 Trackio 和训练所需依赖。
+如果本机已有第 4 节列出的最佳 EMA 检查点，优先核对部署坐标并进行真实任务对比，无需为了使用该模型重新从头训练。需要新训练时，在仓库根目录执行：
 
 ```bash
-cd /home/scl/work/lerobot
+# 默认 regularized：小 U-Net、颜色增强和 EMA。
+bash scripts/train_dp_handumi_tcp.sh data/handumi_data/umi-demo-tcp-dp-240_134
 
-uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" \
-  --dataset.repo_id=fastumi/pick \
-  --dataset.root=/home/scl/work/UMI/FastUMI_Data/dataset/pick_place/lerobot/pick \
-  --dataset.eval_split=0.1 \
-  --dataset.video_backend=torchcodec \
-  --dataset.image_transforms.enable=false \
-  --policy.type=diffusion \
-  --policy.use_relative_pose=false \
-  --policy.n_obs_steps=2 \
-  --policy.horizon=16 \
-  --policy.n_action_steps=8 \
-  --policy.drop_n_last_frames=7 \
-  --policy.down_dims='[512,1024,2048]' \
-  --policy.noise_scheduler_type=DDPM \
-  --policy.num_train_timesteps=100 \
-  --policy.resize_shape='[224,224]' \
-  --policy.crop_ratio=0.95 \
-  --policy.device=cuda \
-  --policy.push_to_hub=false \
-  --output_dir=outputs/train/dp_pick_episode_start_tcp_rerun \
-  --job_name=dp_pick_episode_start_tcp_rerun \
-  --seed=1000 \
-  --batch_size=128 \
-  --num_workers=4 \
-  --steps=19466 \
-  --eval_steps=1000 \
-  --save_freq=2000 \
-  --log_freq=200 \
-  --env_eval_freq=0 \
-  --trackio.enable=true \
-  --trackio.project=lerobot \
-  --trackio.disable_artifact=true
+# 复现 baseline：大 U-Net、不使用图像增强和 EMA。
+bash scripts/train_dp_handumi_tcp.sh data/handumi_data/umi-demo-tcp-dp-240_134 --recipe baseline
 ```
 
-单卡时，将 `uv run torchrun ... "$(uv run which lerobot-train)"` 替换成 `uv run lerobot-train`。每卡 batch 不变时，总 batch 会从 256 降至 128；若希望保持近似的数据遍历次数，应相应增加总步数。
+第一个参数也可以是绝对路径。需要使用 224×224 数据时，将数据目录替换为 `data/handumi_data/umi-demo-tcp-dp`。两种配方的输出目录分别为：
 
-### 3.3 关键参数
+```text
+outputs/train/dp_handumi_tcp_regularized_<启动时间>/
+outputs/train/dp_handumi_tcp_baseline_<启动时间>/
+```
 
-| 参数 | 本次取值与含义 |
+训练参数以 [脚本](../../scripts/train_dp_handumi_tcp.sh) 和实际检查点的 `train_config.json` 为准；调整参数时应同步确认验证协议，避免把不同设置产生的 loss 直接比较。
+
+### 3.2 关键参数
+
+| 参数 | 默认 regularized 的取值与含义 |
 |---|---|
 | `use_relative_pose=false` | 保持数据集的起始 TCP 坐标和轴角表示；state/action 使用 MIN_MAX 归一化 |
 | `n_obs_steps=2` | 输入当前帧及前一帧观测；回合起点缺少历史时重复首帧 |
-| `horizon=16` | 预测 16 帧动作序列，时间范围为 `t-1` 到 `t+14` |
-| `n_action_steps=8` | 从当前时刻开始执行其中 8 步，再重新预测；30 Hz 下约 0.27 秒 |
-| `drop_n_last_frames=7` | 回合末尾 7 帧不作为训练采样起点，减少动作块补齐；不代表所有动作窗口都无补齐 |
-| `down_dims=[512,1024,2048]` | U-Net 通道配置 |
-| `DDPM`、`num_train_timesteps=100` | 100 个训练扩散时间步；本次 `num_inference_steps=null`，推理沿用 100 步 |
-| `crop_ratio=0.95` | 224×224 图像裁剪为 212×212；训练随机裁剪，推理中心裁剪 |
-| `image_transforms.enable=false` | 关闭数据集级图像增强；策略内部的随机裁剪仍然启用 |
-| `batch_size=128` | 每卡 batch 128，双卡总有效 batch 256，梯度累积为 1 |
-| `eval_steps=1000` | 每 1000 步计算留出回合的 `eval_loss` |
-| `save_freq=2000` | 每 2000 步保存，并保存最终步检查点 |
-| `env_eval_freq=0` | 关闭环境 rollout 评估；留出数据集的 loss 验证仍然启用 |
-| `trackio.enable=true` | 上述新训练命令默认记录 Trackio 曲线；原始训练为 `false` |
-| `trackio.project=lerobot` | 将运行记录归入本地 `lerobot` 项目 |
-| `trackio.disable_artifact=true` | 不向 Trackio 上传模型文件，仍记录训练与验证指标 |
+| `horizon=16` | 预测 `t-1` 到 `t+14` 的 16 帧动作 |
+| `n_action_steps=8` | 从当前时刻起执行其中 8 步，再重新预测；30 Hz 下约 0.27 秒 |
+| `drop_n_last_frames=7` | 不从回合末尾 7 帧采样，减少动作块补齐；不代表所有动作窗口都无补齐 |
+| `down_dims=[256,512,1024]` | 小 U-Net；baseline 为 `[512,1024,2048]` |
+| 图像增强 | GPU 上对亮度、对比度使用 `[0.8,1.2]`，饱和度使用 `[0.9,1.1]` 的温和 `ColorJitter`；不做几何增强。baseline 关闭增强 |
+| EMA | 使用 warmup EMA；`eval_use_ema=true`，以 EMA 验证损失选择 `best`。baseline 不启用 EMA |
+| 扩散调度 | DDPM，`num_train_timesteps=100`；本次检查点推理沿用 100 步 |
+| `batch_size=128` | 每卡 128、双卡总有效 batch 为 256，梯度累积为 1 |
+| `steps=19466` | 总训练步数；Adam 学习率 `1e-4`、weight decay `1e-6`，cosine 调度、warmup 500 步 |
+| `eval_steps=500`、`eval_seed=1000` | 每 500 步以固定种子计算留出回合损失；各数据并行进程使用种子加进程序号 |
+| `save_freq=2000` | 每 2000 步及最终步更新 `last`；创新低时更新 `best`，仅保留受管理的最佳及最新检查点 |
+| `env_eval_freq=0` | 关闭环境 rollout；留出数据集 loss 验证仍然启用 |
+| `trackio.enable=true` | 记录训练与验证指标，默认项目为 `lerobot` |
 
-检查点中的其他设置：ResNet18＋ImageNet 预训练权重、学习率 `1e-4`、cosine 调度、warmup 500 步、无混合精度、未启用 EMA。调整学习率应使用 `--policy.optimizer_lr`；默认训练预设会覆盖单独设置的 `--optimizer.lr`。
+两种配方均使用 ImageNet 预训练 ResNet18，不启用混合精度。脚本不指定额外的图像 resize 或 crop；本次 240×134 检查点的 `resize_shape=null`、`crop_shape=null`，`crop_ratio=1.0`。其他检查点应以各自的 `config.json` 和保存的处理器为准，不能假定所有模型都使用 224×224 输入。
 
-不要额外加载 [dp_fastumi_config.json](./dp_fastumi_config.json) 来复现本次训练：该文件使用不同的通道数、DDIM 和扩散步数。
+颜色增强只用于训练，留出回合验证和独立离线评估均不使用该增强。
 
-### 3.4 换数据集时如何调整步数
+如需调整学习率，应使用 `--policy.optimizer_lr`；默认训练预设会覆盖单独设置的 `--optimizer.lr`。不要额外加载 [dp_fastumi_config.json](./dp_fastumi_config.json) 来复现本次训练：该文件使用不同的通道数、DDIM 和扩散步数。
+
+选择其他数据集或硬件时，可用以下公式估算数据遍历次数；尾帧采样和 batch 取整会带来差异，仍应核对训练日志：
 
 ```text
 总有效 batch = 每卡 batch × GPU 数 × 梯度累积步数
 近似 epoch 数 = steps × 总有效 batch / 训练集帧数
-steps ≈ 目标 epoch 数 × 训练集帧数 / 总有效 batch
 ```
 
-本次 `19466 × 256 / 41528 ≈ 120`，约为 120 个 epoch。应使用划分后的训练集帧数估算，并以训练日志的 `epch` 字段核对；尾帧采样规则和 batch 取整会影响实际遍历情况。19466 只是本次配置的总步数，不代表其他数据集也应使用相同步数。
+`19466` 是当前脚本的配置值，并非适用于所有数据集的最佳步数。
 
-### 3.5 查看训练曲线
-
-训练过程中或结束后，在训练机器上另开终端，进入仓库并启动 Trackio 面板：
+### 3.3 查看训练曲线
 
 ```bash
-cd /home/scl/work/lerobot
-uv run trackio show --project lerobot
+uv run --extra training trackio show --project lerobot --host 0.0.0.0
 ```
 
-打开命令输出的网址，在项目中选择 `dp_pick_episode_start_tcp_rerun-<短 ID>` 对应的运行记录。运行名称默认由 `job_name` 加随机短 ID 生成；可在训练命令中用 `--trackio.run_name=<名称>` 显式指定。
+打开命令输出的网址并选择对应的 `dp_handumi_tcp-<短 ID>`。指标默认保存在训练用户的 `~/.cache/huggingface/trackio`，不在训练输出目录中。
 
-- `train/loss`：训练损失，每 `log_freq=200` 步记录一次。
-- `eval/eval_loss`：留出回合的验证损失，每 `eval_steps=1000` 步记录一次，用于观察泛化和过拟合趋势。
-- 横轴选择训练步数（step），可结合平滑曲线观察整体趋势。
+- `train/loss`：每 200 步记录的训练损失。
+- `eval/live_eval_loss`：当前训练权重的验证损失。
+- `eval/ema_eval_loss`：默认 regularized 配方的 EMA 验证损失。
+- `eval/eval_loss`：用于选择 `best` 的验证损失；regularized 取 EMA loss，baseline 取 live loss，每 500 步记录一次。
 
-未设置 `trackio.space_id` 时，指标默认保存在训练用户的 `~/.cache/huggingface/trackio`，不在 `output_dir` 中；训练结束后仍可查看。若通过 SSH 训练，需将面板实际使用的端口转发到本机，再用本机浏览器访问。
+验证固定种子为 1000。它衡量的是扩散噪声预测误差，不直接等于位姿误差或任务成功率。
 
-原始训练未开启 Trackio，无法在面板中补回历史曲线；若保留了 `train.log`，可从日志中的损失数值另行绘图。恢复训练时再开启 Trackio，只能记录后续步骤。
+## 4. 检查点、离线评估与恢复
 
-## 4. 检查训练结果与恢复中断训练
+### 4.1 找到最佳模型
 
-原始训练已完成 19466 步，结果结构为：
+默认配方的输出结构如下；`best` 指向验证损失最低的步数，`last` 指向最新定期或最终检查点：
 
 ```text
-outputs/train/dp_pick_episode_start_tcp/
-├── train.log
+outputs/train/dp_handumi_tcp_regularized_<启动时间>/
+├── split_manifest.json
+├── evaluation_protocol.json
 └── checkpoints/
-    ├── 002000/
-    ├── ...
-    ├── 018000/
-    ├── 019466/
-    │   ├── pretrained_model/
-    │   │   ├── model.safetensors
-    │   │   ├── config.json
-    │   │   ├── train_config.json
-    │   │   ├── policy_preprocessor.json
-    │   │   ├── policy_postprocessor.json
-    │   │   └── *.safetensors（处理器归一化统计量）
-    │   └── training_state/
-    └── last -> 019466
+    ├── <best 或 last 步数>/
+    │   ├── split_manifest.json
+    │   ├── evaluation_protocol.json
+    │   ├── pretrained_model/           # 当前训练权重、配置及处理器
+    │   ├── pretrained_model_ema/       # EMA 权重、配置及处理器
+    │   └── training_state/              # 优化器、调度器、EMA 及随机状态等
+    ├── best -> <最佳步数>
+    └── last -> <最新步数>
 ```
 
-`train.log` 是本次已有运行的日志文件；上面的直接启动命令不会自动将终端输出写到这个文件。
+两个 `pretrained_model*` 目录也分别携带划分清单和验证协议。best 与 last 可能指向同一步；脚本不会自动将终端输出写入 `train.log`。
 
-用于加载模型的最终路径为：
+- 默认 regularized 用于推理或导出的目录：`checkpoints/best/pretrained_model_ema`。
+- baseline 用于推理或导出的目录：`checkpoints/best/pretrained_model`；该配方没有 EMA 目录。
+
+本机本次实验已训练完成，最佳 EMA 目录为：
 
 ```text
-/home/scl/work/lerobot/outputs/train/dp_pick_episode_start_tcp/checkpoints/019466/pretrained_model
+outputs/train/dp_handumi_tcp_regularized_2026-11-06_10-32-15/checkpoints/best/pretrained_model_ema
 ```
 
-核对 `config.json` 中 `use_relative_pose=false`，且 state/action 的 shape 均为 `[7]`。本次前处理器包含归一化，后处理器包含反归一化，均没有相对位姿转换步骤；只复制模型权重会丢失这些配套配置和统计量。
+该路径指向第 **4000** 步；它是本机训练产物，其他机器或新克隆的仓库不一定包含。加载时保留完整模型目录及处理器配置与统计量，并核对 `config.json` 中 `use_relative_pose=false`、state/action 的 shape 均为 `[7]`。
 
-若新训练在达到目标步数前中断，可使用它的最新检查点恢复，例如 `_rerun`：
+### 4.2 独立离线评估
+
+对本机已有模型复评时，可在仓库根目录运行，输出目录请按需要更换：
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=2 "$(uv run which lerobot-train)" \
-  --config_path=outputs/train/dp_pick_episode_start_tcp_rerun/checkpoints/last/pretrained_model/train_config.json \
+uv run --locked --extra diffusion --extra training python scripts/eval_dp_handumi_tcp.py \
+  --checkpoint outputs/train/dp_handumi_tcp_regularized_2026-11-06_10-32-15/checkpoints/best/pretrained_model_ema \
+  --output-dir "outputs/eval/handumi_regularized_$(date +%Y-%m-%d_%H-%M-%S)" \
+  --device cuda:0
+```
+
+也可传入 `checkpoints/best`：工具会根据保存的 `eval_use_ema` 自动选择相应权重。工具使用保存的验证回合清单，对全量有效验证帧分别以种子 `0、1、2` 计算噪声预测 loss；每个回合固定选取 8 个窗口，以相同三个种子执行 100 步 DDPM 采样，比较实际执行的 8 步（标签片段 `action[:, 1:9]`）。结果分别输出位置欧氏误差（米）、旋转测地角误差（弧度）和夹爪绝对误差，并包含逐步、逐回合及逐种子统计。输出目录中的 `results.json` 为结果，`manifest.json` 记录检查点、回合、窗口和采样配置。
+
+本机完整对照的训练过程使用种子 1000 选择最佳步数：baseline 的最佳步数为 5000，regularized 为 4000。随后使用上面的**三个种子独立复评**：
+
+| 指标 | baseline | regularized |
+|---|---:|---:|
+| 验证 loss，三种子均值 | 0.012763 | 0.010282，降低约 19.4% |
+| 位置误差均值 | 0.01169 m | 0.01129 m |
+| 旋转误差均值 | 0.02691 rad | 0.02636 rad |
+| 夹爪绝对误差均值 | 0.00444 | 0.00433 |
+
+优化后验证曲线在最佳步数之后仍有回升；总体均值改善不代表每个窗口都改善，夹爪误差的总体 p95 在本次对照中略有上升。详情见本机实验产物 [验收报告](../../outputs/experiments/handumi_overfit_20261106_9ka3l821/acceptance_report.json) 和 [验证曲线](../../outputs/experiments/handumi_overfit_20261106_9ka3l821/validation_curves.png)；这些输出不会随普通仓库克隆提供。
+
+本次仅完成离线评估，**尚未验证真实机器人任务成功率**。下一步先按第 5 节核对起始坐标、TCP 标定和动作转换，再以同一任务条件比较已有最佳 EMA 与 baseline 的实机表现。
+
+### 4.3 恢复中断的训练
+
+从 `last/pretrained_model/train_config.json` 加载 live 权重，并保留同级的 `training_state/`；EMA 权重会从训练状态恢复。将下面目录替换为实际中断的训练目录：
+
+```bash
+RUN_DIR="outputs/train/dp_handumi_tcp_regularized_2026-11-06_10-32-15"
+uv run --locked --extra diffusion --extra training torchrun --standalone --nproc-per-node=2 \
+  "$(uv run --locked --extra diffusion --extra training which lerobot-train)" \
+  --config_path="$RUN_DIR/checkpoints/last/pretrained_model/train_config.json" \
   --resume=true
 ```
 
-恢复需要保留配套的 `training_state`。原始 `019466` 已达到配置的总步数，用原配置恢复不会再训练额外步数；延长训练涉及总步数与学习率调度安排，不等同于恢复中断。
-
-训练完成后，结合留出回合的动作误差、轨迹表现和实机成功率选择检查点。`eval_loss` 是扩散模型的验证损失，不直接等同于毫米级位姿误差或任务成功率。
+`pretrained_model_ema` 是默认配方的推理和导出目录，不应替代上述 live 检查点用于续训。划分、评估种子、验证权重或 batch／并行拓扑等评价协议发生变化时，不应沿用旧 `best` 损失比较；请使用原协议恢复或另起训练。达到配置总步数后，使用原配置恢复不会再增加训练步数；延长训练需要另行安排总步数和学习率调度。
 
 ## 5. 推理时必须保持同一坐标约定
 

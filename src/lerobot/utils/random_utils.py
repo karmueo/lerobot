@@ -161,11 +161,14 @@ def get_rng_state() -> dict[str, Any]:
         "torch_random_state": torch.random.get_rng_state(),
     }
     if torch.cuda.is_available():
-        random_state_dict["torch_cuda_random_state"] = torch.cuda.random.get_rng_state()
+        # set_seed 会影响全部可见 GPU，因此需要逐卡保存，避免验证扰动训练随机流。
+        random_state_dict["torch_cuda_random_states"] = torch.cuda.random.get_rng_state_all()
+    if torch.backends.mps.is_available():
+        random_state_dict["torch_mps_random_state"] = torch.mps.get_rng_state()
     return random_state_dict
 
 
-def set_rng_state(random_state_dict: dict[str, Any]):
+def set_rng_state(random_state_dict: dict[str, Any]) -> None:
     """Set the random state for `random`, `numpy`, and `torch`.
 
     Args:
@@ -175,7 +178,13 @@ def set_rng_state(random_state_dict: dict[str, Any]):
     np.random.set_state(random_state_dict["numpy_random_state"])
     torch.random.set_rng_state(random_state_dict["torch_random_state"])
     if torch.cuda.is_available():
-        torch.cuda.random.set_rng_state(random_state_dict["torch_cuda_random_state"])
+        if "torch_cuda_random_states" in random_state_dict:
+            torch.cuda.random.set_rng_state_all(random_state_dict["torch_cuda_random_states"])
+        elif "torch_cuda_random_state" in random_state_dict:
+            # 兼容调用方在升级前取得的单卡状态字典。
+            torch.cuda.random.set_rng_state(random_state_dict["torch_cuda_random_state"])
+    if torch.backends.mps.is_available() and "torch_mps_random_state" in random_state_dict:
+        torch.mps.set_rng_state(random_state_dict["torch_mps_random_state"])
 
 
 def set_seed(seed, accelerator: Callable | None = None) -> None:

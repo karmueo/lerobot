@@ -108,3 +108,22 @@ def test_dataset_config_eval_split():
     DatasetConfig(repo_id="user/repo", repo_type="bucket", eval_split=0.1)
     with pytest.raises(ValueError, match="streaming"):
         DatasetConfig(repo_id="user/repo", streaming=True, eval_split=0.1)
+
+
+def test_dataset_config_random_eval_split_round_trip() -> None:
+    # 旧配置默认尾部划分，新配置支持独立选择划分种子。
+    assert DatasetConfig(repo_id="user/repo").eval_split_strategy == "tail"
+    config = draccus.parse(
+        DatasetConfig,
+        args=[
+            "--repo_id=user/repo",
+            "--eval_split=0.1",
+            "--eval_split_strategy=random",
+            "--eval_split_seed=7",
+        ],
+    )
+    restored = draccus.decode(DatasetConfig, draccus.encode(config))
+    assert restored.eval_split_strategy == "random"
+    assert restored.eval_split_seed == 7
+    with pytest.raises(ValueError, match="eval_split_strategy"):
+        DatasetConfig(repo_id="user/repo", eval_split_strategy="invalid")

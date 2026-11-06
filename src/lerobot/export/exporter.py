@@ -37,10 +37,10 @@ if TYPE_CHECKING or _onnx_available:
 
 @dataclass
 class ExportConfig:
-    """导出 CLI；输入输出路径显式提供，避免误用其他训练检查点."""
+    """导出 CLI；默认按传入模型目录名组织产物，也支持显式指定输出目录."""
 
     policy_path: Path
-    output_dir: Path
+    output_dir: Path | None = None
     format: str = "both"
     device: str = "cuda:0"
     trt_precision: str = "both"
@@ -73,7 +73,13 @@ def export_policy(cfg: ExportConfig) -> Path:
         raise ValueError("format must be onnx, tensorrt or both")
     if cfg.trt_precision not in {"fp32", "fp16", "both"}:
         raise ValueError("trt_precision must be fp32, fp16 or both")
-    source, output = cfg.policy_path.resolve(), cfg.output_dir.resolve()
+    # 输出名称取用户传入的目录名，避免 last 符号链接解析后变成检查点步数。
+    policy_path = cfg.policy_path.expanduser()
+    output = (cfg.output_dir or Path("outputs/export") / policy_path.absolute().name).expanduser().resolve()
+    source = policy_path.resolve()
+    # 训练任务根目录默认读取最新检查点；直接传入模型目录仍保持原有行为。
+    if not (source / "config.json").is_file() and (source / "checkpoints").is_dir():
+        source = (source / "checkpoints/last/pretrained_model").resolve()
     if source.is_relative_to(output) or output.is_relative_to(source):
         raise ValueError("Export directory must not overlap the checkpoint directory")
     if output.exists():
