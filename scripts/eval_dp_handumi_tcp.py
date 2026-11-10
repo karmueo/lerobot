@@ -23,6 +23,8 @@
 
 传入 step 目录时依据训练配置中的 ``eval_use_ema`` 选择权重，并在输出中记录；
 也可直接传入 ``pretrained_model`` 或 ``pretrained_model_ema`` 明确选择。
+观测窗口长度从检查点读取，用于选择采样窗口和对齐动作标签。
+``predictions.json`` 按种子、回合和全局锚点帧记录反归一化后的 8 步动作。
 """
 
 import argparse
@@ -126,8 +128,8 @@ def build_windows(
     eval_episodes: Sequence[int],
     absolute_to_relative: Mapping[int, int],
     *,
+    n_obs_steps: int,
     windows_per_episode: int = WINDOWS_PER_EPISODE,
-    n_obs_steps: int = 2,
     n_action_steps: int = 8,
 ) -> list[dict[str, int]]:
     """按原始帧索引等间隔选窗，保证历史观测和执行窗口均无补帧。"""
@@ -284,9 +286,13 @@ def evaluate_actions(
     rename: dict[str, str],
     pre: Any,
     post: Any,
-) -> dict[str, Any]:
-    """固定完整 DDPM 过程后评估实际执行的 8 个预测动作。"""
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """评估实际执行的 8 步动作，并导出同一批反归一化预测。"""
+    # 动作标签从最早观测帧开始，跳过历史帧才能与当前时刻起的预测对齐。
+    start = policy.config.n_obs_steps - 1
+    execution = slice(start, start + policy.config.n_action_steps)
     collected: dict[str, list[np.ndarray]] = {name: [] for name in ("position_m", "rotation_rad", "gripper")}
+    predictions: list[dict[str, Any]] = []
     for seed in EVAL_SEEDS:
         seed_errors: dict[str, list[np.ndarray]] = {name: [] for name in collected}
         offset = 0
@@ -300,25 +306,33 @@ def evaluate_actions(
                     item["episode"] for item in expected
                 ]:
                     raise ValueError("Dataloader returned windows outside the saved evaluation manifest")
-                if batch["action_is_pad"][:, 1:9].any():
+                if batch["action_is_pad"][:, execution].any():
                     raise ValueError("Execution window unexpectedly contains padded actions")
                 for key in ("observation.state_is_pad", *(f"{key}_is_pad" for key in camera_keys)):
                     if key in batch and batch[key].any():
                         raise ValueError(f"Observation window unexpectedly contains padding: {key}")
                 # 预处理器可能就地修改数据，必须先复制物理单位标签。
-                target = batch["action"][:, 1:9].clone()
+                target = batch["action"][:, execution].clone()
                 prepared = prepare_batch(batch, camera_keys, rename, pre)
                 policy.reset()
-                predicted = post(policy.predict_action_chunk(prepared))
+                predicted = post(policy.predict_action_chunk(prepared)).cpu()
                 for name, value in action_errors(target, predicted).items():
                     seed_errors[name].append(value.numpy())
+                # 使用已校验的全局帧索引，避免跨机器比较时依赖子集内的位置。
+                predictions.extend(
+                    {"seed": seed, "episode": episode, "anchor": anchor, "action": action}
+                    for episode, anchor, action in zip(
+                        actual_episodes, actual_indices, predicted.tolist(), strict=True
+                    )
+                )
                 offset += size
         if offset != len(windows):
             raise ValueError(f"Expected {len(windows)} windows, evaluated {offset}")
         for name, values in seed_errors.items():
             collected[name].append(np.concatenate(values, axis=0))
         print(f"Action sampling seed={seed}: {offset} windows", flush=True)
-    return summarize_actions({name: np.stack(values) for name, values in collected.items()}, windows)
+    metrics = summarize_actions({name: np.stack(values) for name, values in collected.items()}, windows)
+    return metrics, predictions
 
 
 def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) -> dict[str, Any]:
@@ -349,8 +363,11 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
     if not isinstance(policy, DiffusionPolicy):
         raise ValueError("This evaluator supports Diffusion Policy only")
     cfg = policy.config
-    if (cfg.n_obs_steps, cfg.horizon, cfg.n_action_steps, cfg.use_relative_pose) != (2, 16, 8, False):
-        raise ValueError("Expected n_obs_steps=2, horizon=16, n_action_steps=8 and absolute TCP action")
+    if (cfg.horizon, cfg.n_action_steps, cfg.use_relative_pose) != (16, 8, False):
+        raise ValueError("Expected horizon=16, n_action_steps=8 and absolute TCP action")
+    # 当前时刻起的执行窗口必须完整落在从最早观测帧开始的预测窗口内。
+    if not 1 <= cfg.n_obs_steps <= cfg.horizon - cfg.n_action_steps + 1:
+        raise ValueError("Observation window leaves insufficient room for the execution window")
     action_feature = cfg.action_feature
     if action_feature is None or action_feature.shape != (7,):
         raise ValueError("Expected 7-dimensional TCP actions")
@@ -395,7 +412,13 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
     absolute_to_relative = dataset.absolute_to_relative_idx
     if absolute_to_relative is None:
         raise ValueError("Selected evaluation dataset lacks an index mapping")
-    windows = build_windows(meta.episodes, episodes, absolute_to_relative)
+    windows = build_windows(
+        meta.episodes,
+        episodes,
+        absolute_to_relative,
+        n_obs_steps=cfg.n_obs_steps,
+        n_action_steps=cfg.n_action_steps,
+    )
     valid_sampler = EpisodeAwareSampler(
         meta.episodes["dataset_from_index"],
         meta.episodes["dataset_to_index"],
@@ -415,7 +438,9 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
     )
     print(f"Evaluating {model_dir} on {len(episodes)} held-out episodes", flush=True)
     loss = evaluate_losses(policy, loss_loader, meta.camera_keys, rename, pre)
-    actions = evaluate_actions(policy, action_loader, windows, meta.camera_keys, rename, pre, post)
+    actions, predictions = evaluate_actions(
+        policy, action_loader, windows, meta.camera_keys, rename, pre, post
+    )
     assets = sorted(
         path for path in model_dir.iterdir() if path.is_file() and path.suffix in {".json", ".safetensors"}
     )
@@ -428,6 +453,7 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
         "eval_episodes": episodes,
         "windows": windows,
         "seeds": list(EVAL_SEEDS),
+        "n_obs_steps": cfg.n_obs_steps,
         "action_batch_size": ACTION_BATCH_SIZE,
         "loss_batch_size": LOSS_BATCH_SIZE,
         "scheduler": dict(policy.diffusion.noise_scheduler.config),
@@ -438,6 +464,7 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "manifest.json", identity)
     write_json(output / "results.json", result)
+    write_json(output / "predictions.json", predictions)
     print(
         json.dumps({"checkpoint": str(model_dir), "eval_loss": loss, "actions": actions["overall"]}, indent=2)
     )
@@ -445,7 +472,7 @@ def evaluate(checkpoint: Path, output_dir: Path, device: str, num_workers: int) 
 
 
 def main() -> None:
-    """解析命令行；完整结果和采样身份分别保存为 JSON。"""
+    """解析命令行；将评估结果、采样清单和逐窗口预测保存为 JSON。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)

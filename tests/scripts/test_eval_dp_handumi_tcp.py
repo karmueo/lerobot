@@ -16,6 +16,7 @@
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -83,23 +84,25 @@ def test_validate_split_rejects_overlap_and_different_dataset(tmp_path: Path) ->
         validate_split(manifest, {"dataset": {"repo_id": "other", "root": str(tmp_path)}})
 
 
-def test_windows_are_distinct_inside_episode_and_map_subset_indices() -> None:
+@pytest.mark.parametrize("n_obs_steps", [2, 3])
+def test_windows_are_distinct_inside_episode_and_map_subset_indices(n_obs_steps: int) -> None:
+    """最早采样点必须有完整观测历史，最晚采样点必须有完整动作标签。"""
     rows = [
         {"dataset_from_index": 0, "dataset_to_index": 30},
         {"dataset_from_index": 30, "dataset_to_index": 50},
         {"dataset_from_index": 50, "dataset_to_index": 80},
     ]
     mapping = {absolute: absolute - 30 for absolute in range(30, 50)}
-    windows = build_windows(rows, [1], mapping)
+    windows = build_windows(rows, [1], mapping, n_obs_steps=n_obs_steps)
     anchors = [item["anchor"] for item in windows]
     assert len(anchors) == len(set(anchors)) == 8
-    assert anchors[0] == 31 and anchors[-1] == 42
+    assert anchors[0] == 30 + n_obs_steps - 1 and anchors[-1] == 42
     assert [item["relative_index"] for item in windows] == [index - 30 for index in anchors]
     assert all(item["episode"] == 1 for item in windows)
     with pytest.raises(ValueError, match="too short"):
-        build_windows(rows, [1], mapping, windows_per_episode=13)
+        build_windows(rows, [1], mapping, n_obs_steps=n_obs_steps, windows_per_episode=13)
     with pytest.raises(ValueError, match="Missing frame"):
-        build_windows(rows, [1], {})
+        build_windows(rows, [1], {}, n_obs_steps=n_obs_steps)
 
 
 def test_action_errors_use_physical_units_and_rotation_geometry() -> None:
@@ -120,6 +123,9 @@ def test_action_errors_use_physical_units_and_rotation_geometry() -> None:
 
 
 class _FakePolicy:
+    def __init__(self, n_obs_steps: int = 2) -> None:
+        self.config = SimpleNamespace(n_obs_steps=n_obs_steps, n_action_steps=8)
+
     def __call__(self, batch):
         return batch["action"].mean(), None
 
@@ -128,10 +134,13 @@ class _FakePolicy:
 
     def predict_action_chunk(self, batch):
         # 消耗随机数以核验 seeded_context 能保留调用方随机流。
-        return torch.zeros(len(batch["action"]), 8, 7) + torch.rand(()) * 0
+        action = torch.zeros(len(batch["action"]), 8, 7) + torch.rand(()) * 0
+        # 为每个锚点生成不同的夹爪值，核对批次内的预测与索引配对。
+        action[:, :, 6] = batch["index"][:, None] / 1000
+        return action
 
 
-def _items() -> list[dict]:
+def _items(n_obs_steps: int = 2) -> list[dict]:
     result = []
     for index in range(8):
         action = torch.zeros(16, 7)
@@ -140,7 +149,7 @@ def _items() -> list[dict]:
             {
                 "episode_index": torch.tensor(4),
                 "index": torch.tensor(100 + index),
-                "observation.state_is_pad": torch.tensor([False, False]),
+                "observation.state_is_pad": torch.zeros(n_obs_steps, dtype=torch.bool),
                 "action_is_pad": torch.zeros(16, dtype=torch.bool),
                 "action": action,
             }
@@ -148,32 +157,44 @@ def _items() -> list[dict]:
     return result
 
 
-def test_action_execution_window_is_copied_before_preprocessing() -> None:
-    items = _items()
+@pytest.mark.parametrize("n_obs_steps", [2, 3])
+def test_action_execution_window_is_copied_before_preprocessing(n_obs_steps: int) -> None:
+    items = _items(n_obs_steps)
+    policy = _FakePolicy(n_obs_steps)
     windows = [{"episode": 4, "anchor": 100 + i, "relative_index": i} for i in range(8)]
 
     def mutate_action(batch):
         batch["action"].fill_(999)
         return batch
 
+    def postprocess(action: torch.Tensor) -> torch.Tensor:
+        """模拟反归一化，验证导出使用后处理结果。"""
+        action[:, :, 6] += 0.25
+        return action
+
     torch.manual_seed(12)
     before = torch.random.get_rng_state().clone()
-    result = evaluate_actions(
-        _FakePolicy(), DataLoader(items, batch_size=3), windows, [], {}, mutate_action, lambda x: x
+    result, predictions = evaluate_actions(
+        policy, DataLoader(items, batch_size=3), windows, [], {}, mutate_action, postprocess
     )
     assert torch.equal(torch.random.get_rng_state(), before)
-    # 1..8 才是执行区间；9..15 的未来动作和第 0 个历史动作均不能进入指标。
-    assert result["overall"]["position_m"]["mean"] == pytest.approx(4.5)
-    assert result["first_step"]["position_m"]["mean"] == pytest.approx(1.0)
-    assert result["per_step"]["7"]["position_m"]["mean"] == pytest.approx(8.0)
-    assert result["per_episode"]["4"]["position_m"]["mean"] == pytest.approx(4.5)
+    # 两帧模型执行索引 1..8，三帧模型执行索引 2..9。
+    first, last = n_obs_steps - 1, n_obs_steps + 6
+    assert result["overall"]["position_m"]["mean"] == pytest.approx((first + last) / 2)
+    assert result["first_step"]["position_m"]["mean"] == pytest.approx(first)
+    assert result["per_step"]["7"]["position_m"]["mean"] == pytest.approx(last)
+    assert result["per_episode"]["4"]["position_m"]["mean"] == pytest.approx((first + last) / 2)
     assert len(result["per_seed"]) == 3
+    assert [(row["seed"], row["episode"], row["anchor"]) for row in predictions] == [
+        (seed, 4, anchor) for seed in (0, 1, 2) for anchor in range(100, 108)
+    ]
+    for row in predictions:
+        assert np.asarray(row["action"]).shape == (8, 7)
+        assert [step[6] for step in row["action"]] == pytest.approx([row["anchor"] / 1000 + 0.25] * 8)
 
-    items[0]["action_is_pad"][8] = True
+    items[0]["action_is_pad"][last] = True
     with pytest.raises(ValueError, match="padded actions"):
-        evaluate_actions(
-            _FakePolicy(), DataLoader(items, batch_size=3), windows, [], {}, lambda x: x, lambda x: x
-        )
+        evaluate_actions(policy, DataLoader(items, batch_size=3), windows, [], {}, lambda x: x, lambda x: x)
 
 
 def test_loss_covers_all_frames_and_weights_short_batch() -> None:
