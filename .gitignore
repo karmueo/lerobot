@@ -177,3 +177,5 @@ outputs/
 *.xml
 *.part
 plan.md
+examples/rm75/ros2_ws/log
+examples/rm75/ros2_ws/install

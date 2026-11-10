@@ -404,6 +404,7 @@ all = [
 ]
 
 [project.scripts]
+lerobot-deploy-rm75b="lerobot.deployment.rm75b.cli:main"
 lerobot-export="lerobot.scripts.lerobot_export:main"
 lerobot-validate-export="lerobot.scripts.lerobot_validate_export:main"
 lerobot-build-mp4-sidecar="lerobot.scripts.lerobot_build_mp4_sidecar:main"

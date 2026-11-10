@@ -158,6 +158,8 @@ _motorbridge_smart_servo_available = is_package_available(
     "motorbridge-smart-servo", import_name="motorbridge_smart_servo"
 )
 _unitree_sdk_available = is_package_available("unitree-sdk2py", "unitree_sdk2py")
+# FastUMI USB 相机使用独立的 UVC 包，部署检查模式无需安装该依赖。
+_uvc_available = is_package_available("pupil-labs-uvc", "uvc")
 _pyrealsense2_available = is_package_available("pyrealsense2") or is_package_available(
     "pyrealsense2-macosx", import_name="pyrealsense2"
 )

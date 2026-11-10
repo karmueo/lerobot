@@ -1,0 +1,70 @@
+# 当前 AGX Orin 的串行部署配置；相对路径以 LeRobot 仓库根目录为基准。
+# 默认 CLI 为 dry-run；只有 --mode run 配合 home/start 才允许执行器命令。
+policy:
+  checkpoint: outputs/train/dp_handumi_tcp_yaml_2026-11-09_18-24-13/checkpoints/best/pretrained_model_ema
+  dataset_root: data/handumi_data/umi-demo-tcp-dp-240_134
+  device: cuda:0
+  num_inference_steps: null  # 沿用检查点 DDPM100，改变步数须单独验证。
+  startup_timeout_s: 120.0
+  seed: 0
+arm:
+  ip: 192.168.1.18
+  port: 8080
+  udp_ip: 192.168.1.100
+  udp_port: 8089
+  udp_cycle_ms: 5
+  sdk_root: /home/scl/work/RM_API2/Python
+  urdf: /home/scl/work/FastUMI_Data/assets/rm_75.urdf
+  initial_pose: /home/scl/work/FastUMI_Data/ros2_ws/src/fastumi_bringup/config/initial_pose.yaml
+gripper:
+  network_interface: wlP1p1s0
+  domain_id: 0
+  sides: [left, right]  # 仅首次发现有真实反馈的侧被纳入本次控制。
+  discovery_s: 2.0
+  pos_close_rad: 0.02
+  pos_open_rad: 5.0
+  kp: 5.0
+  kd: 0.05
+  max_speed_rad_s: 6.0
+  max_hold_error_rad: 0.30
+  feedback_timeout_s: 0.25
+  mapping: [[0.0, 0.0], [1.0, 1.0]]  # 每项为 [训练开度, 电机归一化开度]。
+camera:
+  video_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:4.2:1.0-video-index0
+  width: 1920
+  height: 1080
+  fps: 30
+  frame_timeout_s: 0.2
+  history_size: 16
+execution:
+  mode: sequential
+  control_hz: 50
+  fps: 30
+  n_obs_steps: 3
+  n_action_steps: 8
+  velocity_scale: 0.25
+  sync_slop_s: 0.05
+  history_tolerance_s: 0.015
+  input_timeout_s: 0.2
+  inference_timeout_s: 30.0
+  settle_s: 0.3
+  settle_timeout_s: 5.0
+  start_settle_s: 0.5
+  start_joint_tolerance_rad: 0.035
+  start_gripper_min: 0.95
+  stationary_velocity_rad_s: 0.02
+  home_timeout_s: 120.0
+safety:
+  # 边界检查的是基座系 TCP，不是 Link7 或回合起始系位置。
+  workspace_min: [0.05, -0.70, 0.005]  # 基座系 Z 下限为 5 mm，单位为米。
+  workspace_max: [0.90, 0.70, 1.00]
+  max_translation_m: 0.02
+  max_rotation_rad: 0.17453292519943295
+  max_joint_step_rad: 0.17453292519943295
+  feedback_timeout_s: 0.25
+  max_send_gap_s: 0.1
+  drift_translation_m: 0.002
+  drift_rotation_rad: 0.017453292519943295
+logging:
+  output_dir: outputs/deploy/rm75b
+  lock_path: /tmp/lerobot-rm75b.lock
