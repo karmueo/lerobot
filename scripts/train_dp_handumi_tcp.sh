@@ -4,20 +4,50 @@ set -euo pipefail
 training_timestamp="$(date +%Y-%m-%d_%H-%M-%S)"
 
 dataset_path=""
+config_path=""
 # regularized 推理使用 checkpoints/best/pretrained_model_ema；baseline 使用 checkpoints/best/pretrained_model。
 recipe="regularized"
+recipe_specified=false
+recipe_variant="${TRAINING_RECIPE_VARIANT:-}"
+
+usage() {
+  printf '用法: %s <LeRobot 数据集目录> [--recipe baseline|regularized]\n       %s --config_path <训练 YAML 文件>\n' "$0" "$0"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
     --recipe)
       if [[ $# -lt 2 ]]; then
         echo "--recipe 需要 baseline 或 regularized" >&2
         exit 2
       fi
       recipe="$2"
+      recipe_specified=true
       shift 2
       ;;
     --recipe=*)
       recipe="${1#--recipe=}"
+      recipe_specified=true
+      shift
+      ;;
+    --config_path)
+      if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        echo "--config_path 需要训练 YAML 文件路径" >&2
+        exit 2
+      fi
+      config_path="$2"
+      shift 2
+      ;;
+    --config_path=*)
+      config_path="${1#--config_path=}"
+      if [[ -z "$config_path" ]]; then
+        echo "--config_path 需要训练 YAML 文件路径" >&2
+        exit 2
+      fi
       shift
       ;;
     -*)
@@ -34,8 +64,36 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# 两种启动方式共用双卡入口。工作目录由调用方切换到仓库根目录。
+launch_training() {
+  local training_entry
+  training_entry="$(uv run --locked --extra diffusion --extra training which lerobot-train)"
+  exec uv run --locked --extra diffusion --extra training torchrun --standalone --nproc-per-node=2 "$training_entry" "$@"
+}
+
+training_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "$config_path" ]]; then
+  if [[ -n "$dataset_path" || "$recipe_specified" == true || -n "$recipe_variant" ]]; then
+    echo "--config_path 模式的数据集和训练参数由 YAML 指定，请单独使用该选项" >&2
+    exit 2
+  fi
+  if [[ ! -f "$config_path" || ( "$config_path" != *.yaml && "$config_path" != *.yml ) ]]; then
+    echo "训练 YAML 文件不存在或扩展名不是 .yaml/.yml: $config_path" >&2
+    exit 2
+  fi
+  # 配置文件路径相对于调用目录，YAML 内的相对路径则从仓库根目录解析。
+  if [[ "$config_path" != /* ]]; then
+    config_path="$PWD/$config_path"
+  fi
+  cd -- "$training_repo_root"
+  # 启动前生成一次输出路径，让两个进程使用同一个检查点目录。
+  launch_training --config_path="$config_path" \
+    --output_dir="outputs/train/dp_handumi_tcp_yaml_${training_timestamp}"
+fi
+
 if [[ -z "$dataset_path" ]] || [[ "$recipe" != "baseline" && "$recipe" != "regularized" ]]; then
-  echo "用法: $0 <LeRobot 数据集目录> [--recipe baseline|regularized]（默认 regularized）" >&2
+  usage >&2
   exit 2
 fi
 
@@ -46,11 +104,9 @@ if [[ ! -d "$dataset_path" ]] || [[ ! -f "$dataset_path/meta/info.json" ]]; then
 fi
 dataset_root="$(cd -- "$dataset_path" && pwd -P)"
 dataset_name="$(basename -- "$dataset_root")"
-training_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$training_repo_root"
 
 # 实验对照可单独启用小模型或颜色增强，其他训练参数与基线一致。
-recipe_variant="${TRAINING_RECIPE_VARIANT:-}"
 if [[ -n "$recipe_variant" && "$recipe" != "baseline" ]]; then
   echo "TRAINING_RECIPE_VARIANT 仅适用于 baseline 配方" >&2
   exit 2
@@ -81,8 +137,7 @@ fi
 
 # Trackio 可通过 uv run --extra training trackio show --project lerobot 查看。
 # 每 500 步比较验证损失，每 2000 步和最后一步更新 last。
-training_entry="$(uv run --locked --extra diffusion --extra training which lerobot-train)"
-exec uv run --locked --extra diffusion --extra training torchrun --standalone --nproc-per-node=2 "$training_entry" \
+launch_training \
   --dataset.repo_id="handumi/$dataset_name" \
   --dataset.root="$dataset_root" \
   --dataset.eval_split=0.1 \

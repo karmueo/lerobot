@@ -107,7 +107,15 @@ outputs/train/dp_handumi_tcp_regularized_<启动时间>/
 outputs/train/dp_handumi_tcp_baseline_<启动时间>/
 ```
 
-训练参数以 [脚本](../../scripts/train_dp_handumi_tcp.sh) 和实际检查点的 `train_config.json` 为准；调整参数时应同步确认验证协议，避免把不同设置产生的 loss 直接比较。
+也可以从 [训练 YAML](./dp_handumi_tcp_train.yaml) 启动双卡训练：
+
+```bash
+bash scripts/train_dp_handumi_tcp.sh --config_path docs/umi/dp_handumi_tcp_train.yaml
+```
+
+示例保留颜色增强和 EMA，并设置 `policy.n_obs_steps: 3`、`policy.down_dims: [512, 1024, 2048]` 和每卡 `batch_size: 192`。在 YAML 中修改数据集和训练参数，`dataset.root` 的相对路径以仓库根目录为基准。脚本为两个进程统一设置输出目录 `outputs/train/dp_handumi_tcp_yaml_<启动时间>/`。
+
+训练参数以所用配方或 YAML 以及实际检查点的 `train_config.json` 为准；调整参数时应同步确认验证协议，避免把不同设置产生的 loss 直接比较。
 
 ### 3.2 关键参数
 

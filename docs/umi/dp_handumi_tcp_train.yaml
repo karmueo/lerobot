@@ -1,0 +1,99 @@
+# 从 regularized 配方调整观测窗口、U-Net 通道数和每卡 batch。
+# 由 train_dp_handumi_tcp.sh 的 --config_path 加载，检查点写入脚本生成的训练目录。
+
+# 数据集位置、留出验证划分和训练图像增强。
+dataset:
+  # 本地 LeRobot 数据集目录，相对路径以仓库根目录为基准。
+  root: data/handumi_data/umi-demo-tcp-dp-240_134
+  # 数据集标识，切换数据集时与 root 一起更新。
+  repo_id: handumi/umi-demo-tcp-dp-240_134
+  # 从每个任务的完整回合中留出 10% 用于离线验证。
+  eval_split: 0.1
+  # 在每个任务内随机选择验证回合。
+  eval_split_strategy: random
+  # 固定回合划分，便于多次训练复用同一验证集。
+  eval_split_seed: 1000
+  # 使用 TorchCodec 解码数据集的视频帧。
+  video_backend: torchcodec
+  # 训练图像增强配置，验证图像使用原始输入。
+  image_transforms:
+    # 启用训练图像增强。
+    enable: true
+    # 在策略所在 GPU 上批量执行增强。
+    backend: gpu
+    # 每帧最多应用一个增强项。
+    max_num_transforms: 1
+    # 可供抽样的增强项，以名称为键。
+    tfs:
+      # 仅调整颜色，保持图像与 TCP 标签的几何对应关系。
+      color:
+        # 从多个增强项中抽样时的相对权重。
+        weight: 1.0
+        # 使用 ColorJitter 随机调整亮度、对比度和饱和度。
+        type: ColorJitter
+        # 传给 ColorJitter 的倍率采样范围，1.0 表示维持原值。
+        kwargs:
+          # 亮度倍率从 0.8 到 1.2 随机采样。
+          brightness: [0.8, 1.2]
+          # 对比度倍率从 0.8 到 1.2 随机采样。
+          contrast: [0.8, 1.2]
+          # 饱和度倍率从 0.9 到 1.1 随机采样。
+          saturation: [0.9, 1.1]
+
+# 扩散策略的观测窗口、动作窗口和网络结构。
+policy:
+  # 使用 Diffusion Policy 预测动作序列。
+  type: diffusion
+  # 数据集已使用回合首帧 TCP 坐标，保持 7 维位姿表示。
+  use_relative_pose: false
+  # 每次输入当前帧及前两帧观测。
+  n_obs_steps: 3
+  # 每次预测 16 帧动作，时间窗口从最早的观测帧开始。
+  horizon: 16
+  # 推理时从当前时刻起执行 8 步动作，再重新预测。
+  n_action_steps: 8
+  # 每个回合最后 7 帧跳过训练采样，减少动作窗口的末端补齐。
+  drop_n_last_frames: 7
+  # U-Net 各下采样阶段的通道数。
+  down_dims: [512, 1024, 2048]
+  # 使用 DDPM 定义扩散加噪和去噪过程。
+  noise_scheduler_type: DDPM
+  # 扩散噪声调度器的训练时间步数。推理步数未单独指定时沿用此值。
+  num_train_timesteps: 100
+  # 在 CUDA 设备上训练策略。
+  device: cuda
+  # 关闭向 Hugging Face Hub 发布策略。
+  push_to_hub: false
+
+# 训练任务名，用于生成 Trackio 运行名称。
+job_name: dp_handumi_tcp
+# 训练随机种子，用于模型初始化和训练数据采样等随机操作。
+seed: 1000
+# 每卡 192，双卡且梯度累积为 1 时总有效 batch 为 384。
+batch_size: 192
+# 每个训练进程的 DataLoader 工作进程数。
+num_workers: 8
+# 总训练步数。
+steps: 19466
+# 每 500 个训练步在留出回合上计算验证损失。
+eval_steps: 500
+# 固定验证时的随机噪声，各数据并行进程按其序号偏移种子。
+eval_seed: 1000
+# 对训练中的策略权重做指数移动平均。
+ema:
+  # 随训练推进逐步增大 EMA 衰减系数。
+  type: warmup
+# 用 EMA 权重计算的验证损失选择 best 检查点。
+eval_use_ema: true
+# 每 2000 步及训练结束时保存并更新 last。
+save_freq: 2000
+# 每 200 步记录一次训练指标。
+log_freq: 200
+# 设为 0 时关闭环境 rollout 评估，留出回合验证仍按 eval_steps 执行。
+env_eval_freq: 0
+# 保留验证损失最低的 best 和最近一次定期或最终保存的 last。
+keep_best_and_last: true
+# Trackio 实验指标记录配置。
+trackio:
+  # 启用训练和验证指标记录。
+  enable: true

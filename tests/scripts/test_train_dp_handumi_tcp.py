@@ -20,23 +20,9 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize(
-    ("recipe", "variant", "dims", "color", "ema"),
-    [
-        (None, None, "[256,512,1024]", True, True),
-        ("baseline", None, "[512,1024,2048]", False, False),
-        ("baseline", "small_only", "[256,512,1024]", False, False),
-        ("baseline", "color_only", "[512,1024,2048]", True, False),
-        ("regularized", None, "[256,512,1024]", True, True),
-    ],
-)
-def test_train_recipe_arguments(
-    tmp_path: Path, recipe: str | None, variant: str | None, dims: str, color: bool, ema: bool
-) -> None:
+@pytest.fixture
+def training_capture(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     # 用替身 uv 捕获命令，确保测试不会启动实际训练或更改数据集。
-    dataset = tmp_path / "dataset"
-    (dataset / "meta").mkdir(parents=True)
-    (dataset / "meta" / "info.json").write_text("{}")
     executable = tmp_path / "uv"
     executable.write_text(
         "#!/usr/bin/env bash\n"
@@ -48,10 +34,35 @@ def test_train_recipe_arguments(
     executable.chmod(0o755)
     capture = tmp_path / "args.txt"
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "TRAINING_TEST_CAPTURE": str(capture)}
+    env.pop("TRAINING_RECIPE_VARIANT", None)
+    return capture, env
+
+
+@pytest.mark.parametrize(
+    ("recipe", "variant", "dims", "color", "ema"),
+    [
+        (None, None, "[256,512,1024]", True, True),
+        ("baseline", None, "[512,1024,2048]", False, False),
+        ("baseline", "small_only", "[256,512,1024]", False, False),
+        ("baseline", "color_only", "[512,1024,2048]", True, False),
+        ("regularized", None, "[256,512,1024]", True, True),
+    ],
+)
+def test_train_recipe_arguments(
+    tmp_path: Path,
+    training_capture: tuple[Path, dict[str, str]],
+    recipe: str | None,
+    variant: str | None,
+    dims: str,
+    color: bool,
+    ema: bool,
+) -> None:
+    dataset = tmp_path / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    capture, env = training_capture
     if variant is not None:
         env["TRAINING_RECIPE_VARIANT"] = variant
-    else:
-        env.pop("TRAINING_RECIPE_VARIANT", None)
     script = Path(__file__).resolve().parents[2] / "scripts" / "train_dp_handumi_tcp.sh"
     args = ["bash", str(script), str(dataset)]
     if recipe is not None:
@@ -81,3 +92,24 @@ def test_train_recipe_arguments(
         assert "--dataset.image_transforms.backend=gpu" in captured
     else:
         assert not any(arg.startswith("--dataset.image_transforms.tfs=") for arg in captured)
+
+
+@pytest.mark.parametrize("equals_form", [False, True])
+def test_train_yaml_arguments(
+    tmp_path: Path, training_capture: tuple[Path, dict[str, str]], equals_form: bool
+) -> None:
+    # 从仓库外传入带空格的相对路径，并确保旧配方的参数不会覆盖 YAML。
+    repo = Path(__file__).resolve().parents[2]
+    config = tmp_path / "training config.yaml"
+    config.write_bytes((repo / "docs" / "umi" / "dp_handumi_tcp_train.yaml").read_bytes())
+    capture, env = training_capture
+    script = repo / "scripts" / "train_dp_handumi_tcp.sh"
+    options = [f"--config_path={config.name}"] if equals_form else ["--config_path", config.name]
+    subprocess.run(["bash", str(script), *options], env=env, cwd=tmp_path, check=True)
+    captured = capture.read_text().splitlines()
+
+    entry = captured.index("/tmp/lerobot-train")
+    assert "--nproc-per-node=2" in captured[:entry]
+    config_arg, output_arg = captured[entry + 1 :]
+    assert config_arg == f"--config_path={config}"
+    assert output_arg.startswith("--output_dir=outputs/train/dp_handumi_tcp_yaml_")
