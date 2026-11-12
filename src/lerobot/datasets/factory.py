@@ -16,7 +16,7 @@
 import logging
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pprint import pformat
 from typing import Any, Literal, cast
 
@@ -26,6 +26,7 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
+from lerobot.transforms.image_resize import LetterboxImageTransform
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
@@ -36,6 +37,23 @@ from .streaming_dataset import DEFAULT_STREAMING_SEED, StreamingLeRobotDataset
 from .utils import resolve_episode_indices
 
 logger = logging.getLogger(__name__)
+
+
+def make_dataset_image_transforms(
+    cfg: TrainPipelineConfig, *, training: bool = True
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """训练与验证共用几何变换；仅训练加载器可附加随机增强。"""
+    transforms_cfg = cfg.dataset.image_transforms
+    augmentation = (
+        ImageTransforms(transforms_cfg)
+        if training and transforms_cfg.enable and transforms_cfg.backend == "dataloader"
+        else None
+    )
+    policy = cfg.trainable_config
+    size = getattr(policy, "resize_shape", None)
+    if getattr(policy, "resize_mode", "stretch") == "letterbox" and size is not None:
+        return LetterboxImageTransform(tuple(size), augmentation)
+    return augmentation
 
 
 def resolve_delta_timestamps(
@@ -119,13 +137,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
     Returns:
         LeRobotDataset | StreamingLeRobotDataset: a StreamingLeRobotDataset when `cfg.dataset.streaming` is set.
     """
-    # On the "gpu" backend the workers only decode; lerobot-train augments each batch on the policy device.
-    image_transforms_cfg = cfg.dataset.image_transforms
-    image_transforms = (
-        ImageTransforms(image_transforms_cfg)
-        if image_transforms_cfg.enable and image_transforms_cfg.backend == "dataloader"
-        else None
-    )
+    # 加载进程先执行确定性几何变换；GPU 后端的随机增强由训练入口执行。
+    image_transforms = make_dataset_image_transforms(cfg)
 
     if isinstance(cfg.dataset.repo_id, str):
         root, repo_type_name = cfg.dataset.root, cfg.dataset.repo_type
@@ -331,13 +344,8 @@ def make_train_eval_datasets(
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta, cfg.rename_map)
 
-    # On the "gpu" backend the workers only decode; lerobot-train augments each batch on the policy device.
-    image_transforms_cfg = cfg.dataset.image_transforms
-    train_image_transforms = (
-        ImageTransforms(image_transforms_cfg)
-        if image_transforms_cfg.enable and image_transforms_cfg.backend == "dataloader"
-        else None
-    )
+    # 训练与验证共用几何变换；验证加载器始终不携带随机增强。
+    train_image_transforms = make_dataset_image_transforms(cfg)
 
     train_dataset = LeRobotDataset(
         cfg.dataset.repo_id,
@@ -359,7 +367,7 @@ def make_train_eval_datasets(
         root=cfg.dataset.root,
         episodes=eval_episodes,
         delta_timestamps=delta_timestamps,
-        image_transforms=None,
+        image_transforms=make_dataset_image_transforms(cfg, training=False),
         depth_output_unit=cfg.dataset.depth_output_unit,
         revision=cfg.dataset.revision,
         video_backend=cfg.dataset.video_backend,

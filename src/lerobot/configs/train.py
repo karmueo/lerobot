@@ -132,6 +132,9 @@ class TrainPipelineConfig(HubMixin):
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
     output_dir: Path | None = None
     job_name: str | None = None
+    # HandUMI 启动器使用的机器 GPU 编号；None 保留旧启动方式及继承的可见设备设置。
+    # 单个编号启动单卡，多个编号按列表顺序启动 DDP；底层训练入口不会自行派生进程。
+    gpu_ids: list[int] | None = None
     # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
     # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the
     # latest checkpoint is downloaded and resumed from). Note that when resuming, the default behavior

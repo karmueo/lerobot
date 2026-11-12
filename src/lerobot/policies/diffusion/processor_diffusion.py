@@ -20,6 +20,7 @@ import torch
 
 from lerobot.processor import (
     AbsolutePoseProcessorStep,
+    DiffusionObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
@@ -67,15 +68,36 @@ def make_diffusion_pre_post_processors(
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
-    if not config.use_relative_pose:
+    needs_observation_step = config.serial_observation or (
+        config.resize_mode == "letterbox" and config.resize_shape is not None
+    )
+    if not config.use_relative_pose and not needs_observation_step:
         return make_default_pre_post_processors(config, dataset_stats)
 
     steps = make_default_policy_processor_steps(config, dataset_stats)
+    # 先在输入所在设备缩图，避免单帧部署输入为 CPU 原图时将 1080p 历史整体搬入 GPU。
+    input_steps: list[ProcessorStep] = [steps.rename_observations, steps.add_batch_dim]
+    if needs_observation_step:
+        input_steps.append(
+            DiffusionObservationProcessorStep(
+                image_keys=list(config.image_features),
+                resize_shape=config.resize_shape if config.resize_mode == "letterbox" else None,
+                serial_observation=config.serial_observation,
+                n_obs_steps=config.n_obs_steps,
+            )
+        )
+    input_steps.append(steps.to_device)
+    if not config.use_relative_pose:
+        input_steps.append(steps.normalize)
+        return make_policy_processor_pipelines(
+            input_steps=input_steps, output_steps=[steps.unnormalize, steps.to_cpu]
+        )
     relative_step = RelativePoseProcessorStep(
         enabled=True,
         state_pose_starts=list(config.relative_pose_state_starts),
         action_pose_starts=config.relative_pose_action_starts,
         n_obs_steps=config.n_obs_steps,
+        serial_observation=config.serial_observation,
     )
     absolute_step = AbsolutePoseProcessorStep(
         enabled=True,
@@ -84,12 +106,6 @@ def make_diffusion_pre_post_processors(
         relative_step=relative_step,
     )
     # 相对转换必须在设备迁移之后（与归一化同设备）、归一化之前；绝对还原在反归一化之后
-    input_steps: list[ProcessorStep] = [
-        steps.rename_observations,
-        steps.add_batch_dim,
-        steps.to_device,
-        relative_step,
-        steps.normalize,
-    ]
+    input_steps.extend([relative_step, steps.normalize])
     output_steps: list[ProcessorStep] = [steps.unnormalize, absolute_step, steps.to_cpu]
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)

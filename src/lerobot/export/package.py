@@ -80,6 +80,7 @@ def processor_assets(root: Path) -> list[str]:
         "rename_observations_processor",
         "to_batch_processor",
         "device_processor",
+        "diffusion_observation_processor",
         "relative_pose_processor",
         "absolute_pose_processor",
         "normalizer_processor",

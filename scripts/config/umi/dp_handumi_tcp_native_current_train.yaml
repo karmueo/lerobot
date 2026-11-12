@@ -1,12 +1,15 @@
-# 从 regularized 配方调整观测窗口、U-Net 通道数和每卡 batch。
+# 原始分辨率视频的双帧串行观测训练；图像仅在加载和推理时缩放。
 # 由 train_dp_handumi_tcp.sh 的 --config_path 加载，检查点写入脚本生成的训练目录。
+
+# 机器 GPU 编号；[1] 单卡，改为 [0, 1] 即双卡 DDP；覆盖继承的 CUDA_VISIBLE_DEVICES。
+gpu_ids: [1]
 
 # 数据集位置、留出验证划分和训练图像增强。
 dataset:
   # 本地 LeRobot 数据集目录，相对路径以仓库根目录为基准。
-  root: data/handumi_data/umi-demo-tcp-dp-240_134
+  root: data/handumi_data/umi-demo-tcp-native-current
   # 数据集标识，切换数据集时与 root 一起更新。
-  repo_id: handumi/umi-demo-tcp-dp-240_134
+  repo_id: handumi/umi-demo-tcp-native-current
   # 从每个任务的完整回合中留出 10% 用于离线验证。
   eval_split: 0.1
   # 在每个任务内随机选择验证回合。
@@ -15,7 +18,7 @@ dataset:
   eval_split_seed: 1000
   # 使用 TorchCodec 解码数据集的视频帧。
   video_backend: torchcodec
-  # 训练图像增强配置，验证图像使用原始输入。
+  # 训练图像增强配置；验证只执行确定性缩放，不应用颜色增强。
   image_transforms:
     # 启用训练图像增强。
     enable: true
@@ -44,11 +47,19 @@ dataset:
 policy:
   # 使用 Diffusion Policy 预测动作序列。
   type: diffusion
-  # 数据集已使用回合首帧 TCP 坐标，保持 7 维位姿表示。
-  use_relative_pose: false
-  # 每次输入当前帧及前两帧观测。
-  n_obs_steps: 3
-  # 每次预测 16 帧动作，时间窗口从最早的观测帧开始。
+  # 文件保存 table 坐标系七维 TCP；预处理转为相对当前帧的内部十维表示。
+  use_relative_pose: true
+  # 每次仅使用本轮停稳后的当前观测，将图像与完整 state 重复为两帧。
+  n_obs_steps: 2
+  # 模型输入分辨率，按 [高, 宽] 指定；null 表示保留原尺寸。
+  resize_shape: [224, 224]
+  # letterbox 等比缩放后居中补黑边；stretch 直接拉伸。
+  resize_mode: letterbox
+  # 开启串行观测；停稳、观测、推理和执行的调度由部署端负责。
+  serial_observation: true
+  # 使用完整补边图像，不额外裁剪。
+  crop_ratio: 1.0
+  # 监督窗口覆盖 t-1 至 t+14；重复观测不会改变动作标签的时间偏移。
   horizon: 16
   # 推理时从当前时刻起执行 8 步动作，再重新预测。
   n_action_steps: 8
@@ -66,10 +77,10 @@ policy:
   push_to_hub: false
 
 # 训练任务名，用于生成 Trackio 运行名称。
-job_name: dp_handumi_tcp
+job_name: dp_handumi_tcp_native_current
 # 训练随机种子，用于模型初始化和训练数据采样等随机操作。
 seed: 1000
-# 每卡 192，双卡且梯度累积为 1 时总有效 batch 为 384。
+# 每卡 192；当前单卡有效 batch 为 192，改为双卡后为 384（梯度累积为 1）。
 batch_size: 192
 # 每个训练进程的 DataLoader 工作进程数。
 num_workers: 8

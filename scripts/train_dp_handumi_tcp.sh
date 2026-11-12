@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 双卡训练首帧 TCP 坐标系中的 7 维位姿，视觉编码器使用数据集原始分辨率。
+# 训练 HandUMI TCP 策略；YAML 可选择 GPU、位姿参考系、图像缩放与串行观测。
 set -euo pipefail
-training_timestamp="$(date +%Y-%m-%d_%H-%M-%S)"
+training_timestamp="$(date +%Y-%m-%d_%H-%M-%S_%N)"
 
 dataset_path=""
 config_path=""
@@ -65,10 +65,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# 两种启动方式共用双卡入口。工作目录由调用方切换到仓库根目录。
+# YAML 模式在初始化 CUDA 前选卡；原有数据集目录模式保持双进程行为。
 launch_training() {
   local training_entry
   training_entry="$(uv run --locked --extra diffusion --extra training which lerobot-train)"
+  if [[ -n "$config_path" ]]; then
+    exec uv run --locked --extra diffusion --extra training python scripts/launch_handumi_training.py \
+      --config-path "$config_path" --training-entry "$training_entry" --timestamp "$training_timestamp"
+  fi
   exec uv run --locked --extra diffusion --extra training torchrun --standalone --nproc-per-node=2 "$training_entry" "$@"
 }
 
@@ -87,9 +91,8 @@ if [[ -n "$config_path" ]]; then
     config_path="$PWD/$config_path"
   fi
   cd -- "$training_repo_root"
-  # 启动前生成一次输出路径，让两个进程使用同一个检查点目录。
-  launch_training --config_path="$config_path" \
-    --output_dir="outputs/train/dp_handumi_tcp_yaml_${training_timestamp}"
+  # 启动器为本次任务生成一次输出路径，供所有训练进程共用。
+  launch_training
 fi
 
 if [[ -z "$dataset_path" ]] || [[ "$recipe" != "baseline" && "$recipe" != "regularized" ]]; then

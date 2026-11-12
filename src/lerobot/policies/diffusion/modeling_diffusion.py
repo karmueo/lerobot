@@ -34,6 +34,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from lerobot.processor import RELATIVE_POSE_ANCHOR_KEY
+from lerobot.processor.diffusion_observation_processor import repeat_latest_observation
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -101,6 +102,18 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
+    def _serial_observations(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """直接调用策略时也遵守串行窗口约定，动作及共享锚点保持原样。"""
+        if not self.config.serial_observation:
+            return batch
+        batch = dict(batch)
+        for key in (OBS_STATE, OBS_ENV_STATE, *self.config.image_features):
+            if key in batch:
+                batch[key] = repeat_latest_observation(
+                    batch[key], self.config.n_obs_steps, 4 if key in self.config.image_features else 2
+                )
+        return batch
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations.
@@ -113,10 +126,11 @@ class DiffusionPolicy(PreTrainedPolicy):
         adds fresh noise at every step, so only DDIM is fully driven by `noise`.
         """
         queues_populated = any(len(q) > 0 for q in self._queues.values())
-        if queues_populated:
+        if queues_populated and not self.config.serial_observation:
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         else:
             batch = {k: v for k, v in batch.items() if k != RELATIVE_POSE_ANCHOR_KEY}
+            batch = self._serial_observations(batch)
             if self.config.image_features:
                 for key in self.config.image_features:
                     if batch[key].ndim == 4:
@@ -152,14 +166,27 @@ class DiffusionPolicy(PreTrainedPolicy):
             batch.pop(ACTION)
         # 相对位姿预处理器写入的参考位姿句柄，不属于模型输入
         anchor = batch.pop(RELATIVE_POSE_ANCHOR_KEY, None)
+        batch = self._serial_observations(batch)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
 
         exclude_keys = []
+        if self.config.serial_observation:
+            # 完整窗口每次由本轮观测重建，不能把上一动作块的观测混入队列。
+            for key in (OBS_STATE, OBS_ENV_STATE, OBS_IMAGES):
+                if key in batch and key in self._queues:
+                    self._queues[key].clear()
+                    self._queues[key].extend(batch[key].unbind(dim=1))
+                    exclude_keys.append(key)
         state = batch.get(OBS_STATE)
-        if self.config.use_relative_pose and state is not None and state.ndim == 3:
+        if (
+            not self.config.serial_observation
+            and self.config.use_relative_pose
+            and state is not None
+            and state.ndim == 3
+        ):
             # 相对位姿预处理器已给出相对当前帧的完整历史 (B, n_obs_steps, D)，历史帧随当前帧变化，
             # 不能沿用队列中旧的结果，直接用它覆盖 state 队列
             self._queues[OBS_STATE].clear()
@@ -182,6 +209,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         # 相对位姿预处理器总会写入参考位姿句柄，训练时不需要
         batch = {k: v for k, v in batch.items() if k != RELATIVE_POSE_ANCHOR_KEY}
+        batch = self._serial_observations(batch)
         if self.config.image_features:
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
@@ -516,7 +544,7 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
-        if config.resize_shape is not None:
+        if config.resize_shape is not None and config.resize_mode == "stretch":
             self.resize = torchvision.transforms.Resize(config.resize_shape)
         else:
             self.resize = None

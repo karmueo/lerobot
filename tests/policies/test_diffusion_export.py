@@ -35,13 +35,15 @@ from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_po
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
 
-def checkpoint(root, relative=False, scheduler="DDPM", images=False, cameras=1, separate=True):
+def checkpoint(root, relative=False, scheduler="DDPM", images=False, cameras=1, separate=True, serial=False):
     """小网络保留真实调度器与处理器，统计量维度覆盖 7→10 的区别."""
     torch.manual_seed(42)
     features = {OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,))}
     if images:
         # 保留至少 3×3 backbone 特征，避免 spatial softmax 在单像素上退化成常量。
-        features["observation.images.front"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96))
+        features["observation.images.front"] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(3, 96, 160) if serial else (3, 96, 96)
+        )
         if cameras == 2:
             features["observation.images.wrist"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96))
     else:
@@ -51,6 +53,9 @@ def checkpoint(root, relative=False, scheduler="DDPM", images=False, cameras=1, 
         input_features=features,
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         use_relative_pose=relative,
+        serial_observation=serial,
+        resize_mode="letterbox" if serial else "stretch",
+        resize_shape=(96, 96) if serial else None,
         noise_scheduler_type=scheduler,
         horizon=4,
         n_obs_steps=2,
@@ -175,6 +180,28 @@ def test_fixed_resize_crop_matches_native(tmp_path, resize):
     images = torch.rand(2, 3, 96, 96)
     with torch.inference_mode():
         torch.testing.assert_close(native(images), wrapped(images), atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_serial_letterbox_onnx_roundtrip(tmp_path, relative):
+    """原始宽屏观测经保存的处理器补边、重复后，在 ONNX 与原生采样中保持一致。"""
+    source, output = tmp_path / "checkpoint", tmp_path / "export"
+    cfg = checkpoint(source, relative=relative, images=True, serial=True, scheduler="DDIM")
+    export_policy(ExportConfig(source, output, format="onnx", device="cpu"))
+    manifest = load_manifest(output)
+    policy = load_policy(source, "cpu")
+    pre, post = load_processors(source, cfg, "cpu")
+    raw = {OBS_STATE: torch.randn(1, 2, 7) * 0.1, "observation.images.front": torch.rand(1, 2, 3, 96, 160)}
+    inputs = encoder_inputs(pre(raw), cfg)
+    assert inputs["observation.images"].shape == (1, 2, 1, 3, 96, 96)
+    native = policy.diffusion
+    with torch.inference_mode():
+        cond = native._prepare_global_conditioning(inputs)
+        trajectory = native.conditional_sample(1, cond, generator=torch.Generator().manual_seed(3))
+        expected = post(trajectory[:, 1:3].clone())
+        runtime = ExportedDiffusion(output, OnnxSession(output, manifest, "cpu"), "cpu", manifest)
+        actual = runtime.predict(raw, seed=3)[0]
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
 
 
 def test_invalid_assets_and_policy(tmp_path):

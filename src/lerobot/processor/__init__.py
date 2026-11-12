@@ -42,6 +42,7 @@ from .converters import (
 )
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .device_processor import DeviceProcessorStep
+from .diffusion_observation_processor import DiffusionObservationProcessorStep
 from .env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
 from .factory import (
     DefaultPolicyProcessorSteps,
@@ -145,6 +146,7 @@ __all__ = [
     "hotswap_stats",
     "IdentityProcessorStep",
     "ImageCropResizeProcessorStep",
+    "DiffusionObservationProcessorStep",
     "InfoProcessorStep",
     "InterventionActionProcessorStep",
     "DefaultPolicyProcessorSteps",

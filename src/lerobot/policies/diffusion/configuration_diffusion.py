@@ -44,6 +44,7 @@ class DiffusionConfig(PreTrainedConfig):
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
             current step and additional steps going back).
+        serial_observation: 串行部署时重复当前停稳观测，训练、验证和推理均不使用之前执行周期的历史。
         use_relative_pose: 是否使用 UMI / FastUMI 风格的 SE(3) 相对位姿：observation.state 历史与 action
             块都表达为相对当前帧位姿的变换 ``inv(T_cur) @ T``，旋转编码为 rot6d；位姿组以外的维度
             （如夹爪）保持绝对值。训练时 state/action 的统计量会在相对空间重新计算。
@@ -64,6 +65,7 @@ class DiffusionConfig(PreTrainedConfig):
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
         resize_shape: (H, W) shape to resize images to as a preprocessing step for the vision
             backbone. If None, no resizing is done and the original image resolution is used.
+        resize_mode: stretch 直接拉伸；letterbox 在归一化前等比缩放并居中补黑边。
         crop_ratio: Ratio in (0, 1] used to derive the crop size from resize_shape
             (crop_h = int(resize_shape[0] * crop_ratio), likewise for width).
             Set to 1.0 to disable cropping. Only takes effect when resize_shape is not None.
@@ -113,6 +115,8 @@ class DiffusionConfig(PreTrainedConfig):
     n_obs_steps: int = 2
     horizon: int = 64
     n_action_steps: int = 32
+    # 串行部署每轮只使用停稳后的当前观测，重复填满历史窗口。
+    serial_observation: bool = False
 
     # SE(3) 相对位姿（UMI / FastUMI 风格），默认关闭，不影响已有用法
     use_relative_pose: bool = False
@@ -136,6 +140,8 @@ class DiffusionConfig(PreTrainedConfig):
     # Vision backbone.
     vision_backbone: str = "resnet18"
     resize_shape: tuple[int, int] | None = None
+    # stretch 保持旧配置语义；letterbox 在归一化前等比缩放并补黑边。
+    resize_mode: str = "stretch"
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None
     crop_is_random: bool = True
@@ -200,9 +206,13 @@ class DiffusionConfig(PreTrainedConfig):
             )
 
         if self.resize_shape is not None and (
-            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
+            len(self.resize_shape) != 2 or any(type(d) is not int or d <= 0 for d in self.resize_shape)
         ):
             raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
+        if self.resize_mode not in ("stretch", "letterbox"):
+            raise ValueError(f"`resize_mode` must be stretch or letterbox. Got {self.resize_mode}.")
+        if self.n_obs_steps < 1:
+            raise ValueError("`n_obs_steps` must be positive.")
         if not (0 < self.crop_ratio <= 1.0):
             raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
 
@@ -311,6 +321,8 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
+        if self.serial_observation:
+            return [0] * self.n_obs_steps
         return list(range(1 - self.n_obs_steps, 1))
 
     @property

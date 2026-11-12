@@ -17,6 +17,7 @@
 """The GPU-backend augmentation step: when it acts, what it touches, and how the trainer wires it."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -273,42 +274,66 @@ def test_train_config_rejects_gpu_backend_on_cpu_policy(tmp_path):
 
 
 @pytest.mark.dataset
-def test_every_worker_transform_site_honours_the_backend():
-    """Each place the dataset factory builds worker transforms must check `backend`, not just `enable`.
+@pytest.mark.parametrize("backend", ["dataloader", "gpu"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("eval_split", [0.0, 0.5])
+@pytest.mark.parametrize("resize_mode", ["stretch", "letterbox"])
+def test_dataset_factories_apply_worker_augmentation_only_for_the_dataloader_backend(
+    monkeypatch: pytest.MonkeyPatch, backend: str, enabled: bool, eval_split: float, resize_mode: str
+) -> None:
+    """验证工厂产生的像素：仅加载器后端增强训练图像，验证始终保留确定性几何变换。"""
+    pytest.importorskip("datasets")
 
-    `make_train_eval_datasets` once checked `enable` alone, so a run with `eval_split > 0` augmented on
-    the workers *and* on the device: up to twice the transforms and none of the throughput the gpu
-    backend exists for. This walks the factory's source and requires every `ImageTransforms(...)`
-    construction to sit under a condition that reads `backend`.
-    """
-    pytest.importorskip("datasets")  # the trainer and the dataset factory need the [dataset] extra
-    import ast
-    import inspect
-
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
     from lerobot.datasets import factory
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
-    tree = ast.parse(inspect.getsource(factory))
-    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    sites = {}
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "ImageTransforms"
-        ):
-            guard, function = None, None
-            scope = node
-            while scope in parents:
-                scope = parents[scope]
-                if guard is None and isinstance(scope, ast.If | ast.IfExp):
-                    guard = scope.test
-                if isinstance(scope, ast.FunctionDef):
-                    function = scope.name
-                    break
-            sites[function] = guard is not None and "backend" in ast.dump(guard)
-    assert sites == {"make_dataset": True, "make_train_eval_datasets": True}, (
-        f"ImageTransforms construction sites and whether each checks image_transforms.backend: {sites}"
+    metadata = SimpleNamespace(
+        storage_format="lerobot", total_episodes=4, features={}, fps=30, episodes={"tasks": [["pick"]] * 4}
     )
+
+    def dataset_stub(*args: object, **kwargs: Any) -> SimpleNamespace:
+        """仅替换数据集磁盘读取，保留工厂创建的真实图像变换。"""
+        return SimpleNamespace(
+            meta=metadata,
+            episodes=kwargs.get("episodes"),
+            num_episodes=metadata.total_episodes,
+            image_transforms=kwargs.get("image_transforms"),
+        )
+
+    monkeypatch.setattr(factory, "load_dataset_metadata", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr(factory, "LeRobotDataset", dataset_stub)
+    transforms = _config()
+    transforms.backend = backend
+    transforms.enable = enabled
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id="lerobot/test",
+            image_transforms=transforms,
+            use_imagenet_stats=False,
+            eval_split=eval_split,
+        ),
+        policy=DiffusionConfig(device="cpu", resize_shape=(8, 8), resize_mode=resize_mode),
+    )
+    full_dataset = factory.make_dataset(cfg)
+    train_dataset, eval_dataset = factory.make_train_eval_datasets(cfg)
+    images = torch.full((2, 3, 4, 8), 0.5)
+
+    for dataset, training in ((full_dataset, True), (train_dataset, True), (eval_dataset, False)):
+        if dataset is None:
+            assert eval_split == 0.0
+            continue
+        actual = dataset.image_transforms(images.clone()) if dataset.image_transforms else images
+        # 固定亮度倍率为 0.5；GPU 后端不能在加载器内提前增强，验证也不能增强。
+        value = 0.25 if training and enabled and backend == "dataloader" else 0.5
+        if resize_mode == "letterbox":
+            expected = torch.zeros(2, 3, 8, 8)
+            expected[..., 2:6, :] = value
+        else:
+            expected = torch.full_like(images, value)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (eval_dataset is None) == (eval_split == 0.0)
 
 
 @pytest.mark.skipif(DEVICE == "cpu", reason="moves frames to the accelerator")

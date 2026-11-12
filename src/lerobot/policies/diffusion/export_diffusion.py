@@ -28,6 +28,9 @@ class FixedRgbEncoder(nn.Module):
         super().__init__()
         self.backbone, self.pool, self.out, self.relu = rgb.backbone, rgb.pool, rgb.out, rgb.relu
         height, width = next(iter(cfg.image_features.values())).shape[-2:]
+        if cfg.resize_mode == "letterbox" and cfg.resize_shape is not None:
+            # 补边已在归一化前由共享处理器完成，导出网络接收目标尺寸。
+            height, width = cfg.resize_shape
         resized = cfg.resize_shape or (height, width)
         self.resize_needed = tuple(resized) != (height, width)
         if self.resize_needed:
@@ -126,6 +129,8 @@ def make_export_modules(policy: DiffusionPolicy):
     inputs = [torch.zeros(1, cfg.n_obs_steps, cfg.model_state_dim, device=device)]
     if cfg.image_features:
         shape = next(iter(cfg.image_features.values())).shape
+        if cfg.resize_mode == "letterbox" and cfg.resize_shape is not None:
+            shape = (shape[0], *cfg.resize_shape)
         inputs.append(torch.zeros(1, cfg.n_obs_steps, len(cfg.image_features), *shape, device=device))
     if cfg.env_state_feature:
         inputs.append(torch.zeros(1, cfg.n_obs_steps, *cfg.env_state_feature.shape, device=device))

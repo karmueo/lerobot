@@ -343,6 +343,8 @@ class RelativePoseProcessorStep(ProcessorStep):
     state_pose_starts: list[int] = field(default_factory=lambda: [0])
     action_pose_starts: list[int] | None = None
     n_obs_steps: int = 1
+    # 串行观测的所有历史帧都与当前帧相同，位姿应写成精确单位变换。
+    serial_observation: bool = False
     _history: deque = field(default_factory=deque, init=False, repr=False)
     _anchor: RelativePoseAnchor = field(default_factory=RelativePoseAnchor, init=False, repr=False)
 
@@ -393,6 +395,9 @@ class RelativePoseProcessorStep(ProcessorStep):
         # 就必须在生成新动作块时锁定参考位姿。训练时策略的 forward 会忽略它。
         new_observation[RELATIVE_POSE_ANCHOR_KEY] = self._anchor
         relative_history = to_relative_pose(history, current, self.state_pose_starts, self.state_pose_starts)
+        if self.serial_observation:
+            for frame in range(relative_history.shape[1]):
+                relative_history = set_frame_to_identity(relative_history, frame, self.state_pose_starts)
         new_observation[OBS_STATE] = set_frame_to_identity(relative_history, -1, self.state_pose_starts)
         new_transition[TransitionKey.OBSERVATION] = new_observation
 
@@ -413,6 +418,7 @@ class RelativePoseProcessorStep(ProcessorStep):
             "state_pose_starts": list(self.state_pose_starts),
             "action_pose_starts": None if self.action_pose_starts is None else list(self.action_pose_starts),
             "n_obs_steps": self.n_obs_steps,
+            "serial_observation": self.serial_observation,
         }
 
     def transform_features(

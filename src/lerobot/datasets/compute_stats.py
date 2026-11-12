@@ -883,7 +883,6 @@ def compute_relative_pose_stats(
     # 与训练时一致使用 float32 做位姿转换；RunningQuantileStats 内部仍以 float64 累加
     all_states = np.asarray(hf_dataset[OBS_STATE], dtype=np.float32)
     all_actions = np.asarray(hf_dataset[ACTION], dtype=np.float32)
-    current_frame = observation_delta_indices.index(0)
     episode_indices = np.asarray(hf_dataset["episode_index"])
     row_start, row_end = _episode_row_bounds(episode_indices)
 
@@ -903,7 +902,10 @@ def compute_relative_pose_stats(
         rel_states = to_relative_pose(
             torch.from_numpy(all_states[obs_rows]), current, state_pose_starts, state_pose_starts
         )
-        rel_states = set_frame_to_identity(rel_states, current_frame, state_pose_starts)
+        # 串行模式可有多个零偏移；每一帧都必须与预处理器一样使用精确单位位姿。
+        for frame, offset in enumerate(observation_delta_indices):
+            if offset == 0:
+                rel_states = set_frame_to_identity(rel_states, frame, state_pose_starts)
         rel_actions = to_relative_pose(
             torch.from_numpy(all_actions[act_rows]), current, action_pose_starts, state_pose_starts
         )

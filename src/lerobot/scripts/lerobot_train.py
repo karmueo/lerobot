@@ -98,6 +98,7 @@ from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor import ImageAugmentationProcessorStep
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
+from lerobot.transforms.image_resize import LetterboxImageTransform
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import (
     ACTION,
@@ -169,7 +170,10 @@ def _make_image_augmentation(
     image_transforms = cfg.dataset.image_transforms
     if not (image_transforms.enable and image_transforms.backend == "gpu"):
         return None
-    if dataset.image_transforms is not None:
+    worker_transforms = dataset.image_transforms
+    if worker_transforms is not None and not (
+        isinstance(worker_transforms, LetterboxImageTransform) and worker_transforms.augmentation is None
+    ):
         raise ValueError(
             "image_transforms.backend='gpu' augments on the device, but the dataset already carries "
             "image_transforms that run in the DataLoader workers. Use one or the other."
